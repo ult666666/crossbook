@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 9c7e30b4b5b902f092fcfe746b8c2007067b23ba4ab7577b92487fe9d9b7e607 # shrinks to commands = [New(NewOrder { id: 1, account: 1, side: Buy, kind: Limit(95), qty: 1, tif: Gtc, post_only: false, stp: Allow }), New(NewOrder { id: 2, account: 3, side: Sell, kind: Limit(95), qty: 7, tif: Gtc, post_only: false, stp: Allow }), New(NewOrder { id: 1, account: 3, side: Buy, kind: Limit(95), qty: 1, tif: Gtc, post_only: false, stp: CancelNewest }), New(NewOrder { id: 3, account: 2, side: Sell, kind: Limit(95), qty: 1, tif: Gtc, post_only: false, stp: Allow }), New(NewOrder { id: 4, account: 1, side: Sell, kind: Limit(95), qty: 4, tif: Gtc, post_only: false, stp: Allow }), Cancel { id: 5 }, New(NewOrder { id: 1, account: 1, side: Sell, kind: Limit(95), qty: 1, tif: Gtc, post_only: false, stp: Allow }), New(NewOrder { id: 5, account: 2, side: Buy, kind: Limit(95), qty: 7, tif: Fok, post_only: false, stp: CancelOldest })]
+cc f36535f03f5f5947bb3d2272565af23263e4c965763211710d90fcc860190ea6 # shrinks to commands = [New(NewOrder { id: 2, account: 1, side: Buy, kind: Limit(103), qty: 3, tif: Gtc, post_only: false, stp: Allow }), Modify { id: 2, price: 103, qty: 3 }]

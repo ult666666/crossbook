@@ -1,0 +1,20 @@
+[workspace]
+resolver = "3"
+members = ["crates/crossbook", "crates/crossbook-cli", "crates/crossbook-wasm"]
+default-members = ["crates/crossbook", "crates/crossbook-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+repository = "https://github.com/ult666666/crossbook"
+authors = ["Charles Dai"]
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+debug = "line-tables-only"
+
+[profile.release.package.crossbook-wasm]
+opt-level = 3

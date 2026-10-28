@@ -1,0 +1,22 @@
+[package]
+name = "crossbook"
+description = "Deterministic limit order book and price-time priority matching engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+keywords = ["order-book", "matching-engine", "exchange", "trading", "fintech"]
+categories = ["finance", "data-structures"]
+
+[dependencies]
+
+[dev-dependencies]
+proptest = "1.12"
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "engine"
+harness = false
