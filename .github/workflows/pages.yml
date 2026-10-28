@@ -30,7 +30,7 @@ jobs:
       - name: Assemble site
         run: |
           mkdir -p _site
-          cp web/index.html web/style.css web/app.js web/scenarios.js _site/
+          cp web/index.html web/style.css web/app.js web/scenarios.js web/stress-worker.js _site/
           cp -r web/pkg _site/pkg
           [ -d web/assets ] && cp -r web/assets _site/assets || true
       - uses: actions/upload-pages-artifact@v5

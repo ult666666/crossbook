@@ -1212,6 +1212,51 @@ function metric(label, value) {
   return h('div', {}, h('dt', {}, label), h('dd', { class: 'num' }, value));
 }
 
+// Runs one stress test in a fresh module worker, so the page stays responsive and the
+// staged commands are released when the worker ends.
+function stressInWorker(count, seed, onMatch) {
+  return new Promise((resolve, reject) => {
+    let worker;
+    try {
+      worker = new Worker(new URL('./stress-worker.js', import.meta.url), { type: 'module' });
+    } catch {
+      reject(Object.assign(new Error('module workers are unavailable'), { name: 'WorkerUnavailable' }));
+      return;
+    }
+    worker.onmessage = ({ data }) => {
+      if (data.type === 'progress') {
+        if (data.phase === 'match') onMatch();
+        return;
+      }
+      worker.terminate();
+      if (data.type === 'done') resolve(data);
+      else reject(new Error(data.message));
+    };
+    worker.onerror = (event) => {
+      event.preventDefault();
+      worker.terminate();
+      reject(new Error(event.message || 'the worker failed'));
+    };
+    worker.postMessage({ count, seed });
+  });
+}
+
+async function stressOnMainThread(count, seed, onMatch) {
+  const playground = new Playground();
+  try {
+    const g0 = performance.now();
+    playground.stage(count, seed);
+    const generationMs = performance.now() - g0;
+    onMatch();
+    await nextPaint();
+    const t0 = performance.now();
+    const summary = JSON.parse(playground.runStaged());
+    return { generationMs, engineMs: performance.now() - t0, summary };
+  } finally {
+    playground.free();
+  }
+}
+
 async function runStress() {
   if (state.stressRunning || !state.engine) return;
   const count = state.stressCount;
@@ -1227,21 +1272,14 @@ async function runStress() {
   announce(`Stress test started with ${fmt.format(count)} commands.`);
   await nextPaint();
 
-  let playground = null;
   try {
-    playground = new Playground();
-    const g0 = performance.now();
-    playground.stage(count, seed);
-    const generationMs = performance.now() - g0;
-
-    stressStatus(`Matching ${fmt.format(count)} commands…`);
-    await nextPaint();
-
-    const t0 = performance.now();
-    const json = playground.runStaged();
-    const engineMs = performance.now() - t0;
-
-    renderStressResult({ count, seed, generationMs, engineMs, summary: JSON.parse(json) });
+    const onMatch = () => stressStatus(`Matching ${fmt.format(count)} commands…`);
+    const result = await stressInWorker(count, seed, onMatch).catch((error) => {
+      // Browsers without module workers fall back to running on the main thread.
+      if (error?.name === 'WorkerUnavailable') return stressOnMainThread(count, seed, onMatch);
+      throw error;
+    });
+    renderStressResult({ count, seed, ...result });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     fill(
@@ -1250,11 +1288,6 @@ async function runStress() {
     );
     announce('The stress test stopped before it finished.');
   } finally {
-    try {
-      playground?.free();
-    } catch {
-      // The instance is gone either way.
-    }
     ui.stressRun.textContent = 'Run stress test';
     ui.stressOut.setAttribute('aria-busy', 'false');
     // Clicks made while the main thread was busy arrive now; let them hit the guard first.
