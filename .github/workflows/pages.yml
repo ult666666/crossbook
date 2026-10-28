@@ -1,0 +1,51 @@
+name: Deploy playground
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@0.2.129
+      - run: scripts/build-web.sh
+      - name: Assemble site
+        run: |
+          mkdir -p _site
+          cp web/index.html web/style.css web/app.js web/scenarios.js _site/
+          cp -r web/pkg _site/pkg
+          [ -d web/assets ] && cp -r web/assets _site/assets || true
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    # Deploys once Pages is enabled with "GitHub Actions" as its source
+    # (Settings > Pages). Until then the build still runs and is checked.
+    if: github.event.repository.has_pages
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

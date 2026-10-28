@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # x86-64 Linux, ARM64 macOS and x86-64 Windows: the golden digest tests
+        # require bit-identical results on every platform.
+        os: [ubuntu-24.04, macos-15, windows-2025]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        if: runner.os == 'Linux'
+        run: cargo fmt --all --check
+      - name: Lint
+        if: runner.os == 'Linux'
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace --release
+        env:
+          PROPTEST_CASES: ${{ runner.os == 'Linux' && '4096' || '512' }}
+      - name: Differential check on one million synthetic commands
+        run: cargo run --release -p crossbook-cli -- verify --orders 1000000 --seed 7
+      - name: Documentation
+        if: runner.os == 'Linux'
+        run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  msrv:
+    name: Minimum supported Rust (1.88)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --lib --bins
+
+  web:
+    name: WebAssembly determinism and browser smoke test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@0.2.129
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Native and WebAssembly builds agree on one million commands
+        run: scripts/check-determinism.sh 1000000 42
+      - name: Build the playground
+        run: scripts/build-web.sh
+      - name: Browser smoke test
+        working-directory: web
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+          npm run smoke

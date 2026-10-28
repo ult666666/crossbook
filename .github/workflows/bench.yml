@@ -1,0 +1,42 @@
+name: Benchmark
+
+# Manual run on a GitHub-hosted runner, so published numbers come from a machine
+# anyone can reproduce on, not only from a laptop.
+on:
+  workflow_dispatch:
+    inputs:
+      orders:
+        description: Synthetic commands per run
+        default: "5000000"
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Throughput and latency
+        env:
+          ORDERS: ${{ inputs.orders }}
+        run: |
+          cargo build --release -p crossbook-cli
+          mkdir -p bench-results
+          for seed in 1 2 3; do
+            ./target/release/crossbook bench --orders "$ORDERS" --seed "$seed" --json | tee -a bench-results/cli.jsonl
+          done
+          {
+            echo '### crossbook bench (ubuntu-24.04 runner)'
+            echo '```'
+            ./target/release/crossbook bench --orders "$ORDERS" --seed 42
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Criterion micro-benchmarks
+        run: cargo bench -p crossbook --bench engine -- --noplot | tee bench-results/criterion.txt
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bench-results
+          path: bench-results
