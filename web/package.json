@@ -1,0 +1,17 @@
+{
+  "name": "crossbook-playground",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Browser playground for the crossbook matching engine",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "smoke": "node smoke.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.63.0"
+  }
+}

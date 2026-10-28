@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>crossbook · matching engine playground</title>
+  <meta name="description" content="A deterministic limit order book and matching engine in Rust, running in your browser through WebAssembly. Place orders, run guided scenarios and a stress test.">
+  <meta property="og:title" content="crossbook · matching engine playground">
+  <meta property="og:description" content="A deterministic matching engine in Rust, running in your browser through WebAssembly.">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#eceef2" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#0c0f13" media="(prefers-color-scheme: dark)">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2314171d'/%3E%3Crect x='7' y='7' width='18' height='4' rx='1' fill='%23ff8a7c'/%3E%3Crect x='7' y='13' width='12' height='4' rx='1' fill='%23ff8a7c'/%3E%3Crect x='7' y='21' width='15' height='4' rx='1' fill='%2347c597'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="./style.css">
+  <link rel="modulepreload" href="./app.js">
+  <link rel="modulepreload" href="./pkg/crossbook_wasm.js">
+  <link rel="modulepreload" href="./scenarios.js">
+  <link rel="preload" href="./pkg/crossbook_wasm_bg.wasm" as="fetch" type="application/wasm" crossorigin>
+  <script type="module" src="./app.js"></script>
+  <noscript><style>.spread-main { visibility: hidden; }</style></noscript>
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header-inner">
+      <div class="brand">
+        <h1 class="wordmark">
+          <svg class="wordmark-mark" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+            <rect x="2" y="2" width="16" height="3" rx="1" class="mark-ask"/>
+            <rect x="2" y="7" width="10" height="3" rx="1" class="mark-ask"/>
+            <rect x="2" y="13" width="13" height="3" rx="1" class="mark-bid"/>
+          </svg>
+          crossbook
+        </h1>
+        <p class="tagline">A deterministic matching engine in Rust, running in your browser through WebAssembly.</p>
+      </div>
+      <nav class="header-links" aria-label="Project">
+        <a href="https://github.com/ult666666/crossbook">Source on GitHub<svg class="icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M5.5 3.5h7v7M12.5 3.5l-9 9"/></svg></a>
+        <a href="https://github.com/ult666666/crossbook/blob/main/docs/DESIGN.md">How it works<svg class="icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M5.5 3.5h7v7M12.5 3.5l-9 9"/></svg></a>
+      </nav>
+    </div>
+  </header>
+
+  <noscript>
+    <p class="noscript">The playground runs the engine with JavaScript and WebAssembly. Turn on JavaScript to use it.</p>
+  </noscript>
+
+  <main class="workspace" id="main">
+    <!-- Order ticket -->
+    <section class="panel ticket" aria-labelledby="ticket-title">
+      <div class="panel-head">
+        <h2 id="ticket-title">Order ticket</h2>
+      </div>
+      <form class="panel-body ticket-form" id="ticket-form" novalidate>
+        <div class="ticket-grid">
+          <div class="field">
+            <span class="label" id="lbl-side">Side</span>
+            <div class="seg seg-side" role="group" aria-labelledby="lbl-side" data-field="side">
+              <button type="button" data-value="buy" aria-pressed="true">Buy</button>
+              <button type="button" data-value="sell" aria-pressed="false">Sell</button>
+            </div>
+          </div>
+          <div class="field">
+            <span class="label" id="lbl-kind">Type</span>
+            <div class="seg" role="group" aria-labelledby="lbl-kind" data-field="kind">
+              <button type="button" data-value="limit" aria-pressed="true">Limit</button>
+              <button type="button" data-value="market" aria-pressed="false">Market</button>
+            </div>
+          </div>
+          <div class="field">
+            <label class="label" for="price">Price</label>
+            <div class="stepper" id="price-stepper">
+              <button type="button" class="step" data-step="-1" aria-label="Lower price by one tick" aria-controls="price">
+                <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M3.5 8h9"/></svg>
+              </button>
+              <input id="price" name="price" type="number" inputmode="numeric" min="0" max="999999" step="1" value="100" autocomplete="off">
+              <button type="button" class="step" data-step="1" aria-label="Raise price by one tick" aria-controls="price">
+                <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M3.5 8h9M8 3.5v9"/></svg>
+              </button>
+            </div>
+          </div>
+          <div class="field">
+            <label class="label" for="qty">Quantity</label>
+            <input class="input num-input" id="qty" name="qty" type="number" inputmode="numeric" min="0" max="999999" step="1" value="5" autocomplete="off">
+          </div>
+          <div class="field">
+            <span class="label" id="lbl-tif">Time in force</span>
+            <div class="seg" role="group" aria-labelledby="lbl-tif" data-field="tif">
+              <button type="button" data-value="gtc" aria-pressed="true" aria-label="GTC, good till canceled">GTC</button>
+              <button type="button" data-value="ioc" aria-pressed="false" aria-label="IOC, immediate or cancel">IOC</button>
+              <button type="button" data-value="fok" aria-pressed="false" aria-label="FOK, fill or kill">FOK</button>
+            </div>
+          </div>
+          <div class="field">
+            <span class="label" id="lbl-account">Account</span>
+            <div class="seg" role="group" aria-labelledby="lbl-account" data-field="account">
+              <button type="button" data-value="1" aria-pressed="false">Ana</button>
+              <button type="button" data-value="2" aria-pressed="true">Ben</button>
+              <button type="button" data-value="3" aria-pressed="false">Cleo</button>
+            </div>
+          </div>
+          <div class="field field-wide">
+            <label class="label" for="stp">Self-trade prevention</label>
+            <span class="select-wrap">
+              <select class="input select" id="stp" name="stp">
+                <option value="allow" selected>Off (allow self-trades)</option>
+                <option value="cancel-newest">Cancel newest (incoming order)</option>
+                <option value="cancel-oldest">Cancel oldest (resting order)</option>
+                <option value="cancel-both">Cancel both</option>
+              </select>
+            </span>
+          </div>
+          <div class="field field-wide">
+            <label class="check">
+              <input type="checkbox" id="post-only" name="postOnly" aria-labelledby="post-only-title" aria-describedby="post-only-desc">
+              <span><span class="check-title" id="post-only-title">Post-only</span> <span class="check-desc" id="post-only-desc">Rejected instead of trading on arrival.</span></span>
+            </label>
+          </div>
+        </div>
+        <button type="submit" class="submit is-buy" id="submit" disabled>
+          <span id="submit-label">Buy <span class="num">5</span> @ <span class="num">100</span></span>
+        </button>
+        <p class="ticket-result" id="ticket-result" hidden></p>
+        <p class="ticket-hint" id="ticket-hint">Buys at 100 or less. Any remainder rests on the book.</p>
+      </form>
+    </section>
+
+    <!-- Order book -->
+    <section class="panel book" aria-labelledby="book-title">
+      <div class="panel-head">
+        <h2 id="book-title">Order book</h2>
+        <button type="button" class="btn btn-quiet btn-small" id="clear-book" disabled>Clear book</button>
+      </div>
+      <p class="panel-note">Select a price to copy it to the ticket, or an order to cancel or modify it.</p>
+      <div class="ladder" id="ladder" aria-busy="true">
+        <div class="ladder-cols" aria-hidden="true">
+          <span>Side</span><span class="right">Price</span><span class="right">Lots</span><span>Queue, oldest first</span>
+        </div>
+        <ol class="ladder-side asks" id="asks" aria-label="Asks, best price last"></ol>
+        <div class="spread" id="spread">
+          <span class="spread-main">Loading the engine…</span>
+        </div>
+        <ol class="ladder-side bids" id="bids" aria-label="Bids, best price first"></ol>
+      </div>
+      <p class="ladder-foot" id="book-status"><span class="foot-legend">Chip: id, account, lots. PO: post-only.</span></p>
+    </section>
+
+    <!-- Selected order -->
+    <section class="panel selection" aria-labelledby="selection-title">
+      <div class="panel-head">
+        <h2 id="selection-title">Selected order</h2>
+        <button type="button" class="btn btn-quiet btn-small" id="deselect" hidden>Deselect</button>
+      </div>
+      <div class="panel-body">
+        <p class="empty-note" id="selection-empty" tabindex="-1">Select an order in the book to cancel or modify it.</p>
+        <div class="selection-body" id="selection-body" hidden>
+          <p class="sel-summary" id="sel-summary"></p>
+          <form class="modify-form" id="modify-form" novalidate>
+            <div class="field">
+              <label class="label" for="mod-price">New price</label>
+              <input class="input num-input" id="mod-price" type="number" inputmode="numeric" min="0" max="999999" step="1" autocomplete="off">
+            </div>
+            <div class="field">
+              <label class="label" for="mod-qty">New quantity</label>
+              <input class="input num-input" id="mod-qty" type="number" inputmode="numeric" min="0" max="999999" step="1" autocomplete="off">
+            </div>
+            <button type="submit" class="btn" id="modify-btn">Modify</button>
+            <button type="button" class="btn btn-danger" id="cancel-btn">Cancel order</button>
+          </form>
+          <p class="hint">Same price with fewer lots keeps the queue place. Any other change sends the order to the back.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- Guided scenarios -->
+    <section class="panel scenarios" aria-labelledby="scenarios-title">
+      <div class="panel-head">
+        <h2 id="scenarios-title">Guided scenarios</h2>
+        <span class="panel-meta">Loading one resets the book</span>
+      </div>
+      <div class="scenarios-body">
+        <ul class="scenario-list" id="scenario-list" aria-label="Scenarios"></ul>
+        <div class="scenario-detail" id="scenario-detail">
+          <p class="empty-note" id="scenario-empty">Pick a scenario. It resets the book and places its starting orders.</p>
+          <div class="sc-content" id="scenario-content" hidden>
+            <div class="sc-main">
+              <h3 class="sc-title" id="sc-title"></h3>
+              <p class="sc-rule" id="sc-rule"></p>
+              <div class="sc-setup">
+                <span class="label">Starting book</span>
+                <ul class="sc-setup-list" id="sc-setup"></ul>
+              </div>
+              <div class="sc-actions">
+                <button type="button" class="btn btn-primary" id="sc-action"></button>
+                <button type="button" class="btn" id="sc-follow" hidden></button>
+                <button type="button" class="btn btn-quiet" id="sc-restart">Restart</button>
+              </div>
+              <p class="sc-dirty" id="sc-dirty" hidden>The book changed after this scenario loaded, so results may differ. Restart to replay it.</p>
+            </div>
+            <div class="sc-side">
+              <div class="sc-explain" id="sc-explain" hidden>
+                <span class="label">What happened</span>
+                <p id="sc-explain-text"></p>
+              </div>
+              <p class="sc-waiting" id="sc-waiting">Run the step to see what happened.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Event log -->
+    <section class="panel log" aria-labelledby="log-title">
+      <div class="panel-head">
+        <h2 id="log-title">Event log</h2>
+        <span class="panel-meta">Newest first</span>
+      </div>
+      <div class="log-scroll" tabindex="0" role="region" aria-label="Event log entries, newest first">
+        <ol class="log-list" id="log-list"></ol>
+        <p class="empty-note log-empty" id="log-empty">Commands and the engine’s events appear here.</p>
+      </div>
+    </section>
+
+    <!-- Stress test -->
+    <section class="panel stress" aria-labelledby="stress-title">
+      <div class="panel-head">
+        <h2 id="stress-title">Stress test</h2>
+      </div>
+      <div class="panel-body stress-body">
+        <div class="stress-grid">
+          <div class="stress-setup">
+            <p class="stress-intro">Generate a seeded stream of synthetic orders, cancels and modifies, then time the engine on it.</p>
+            <div class="stress-controls">
+              <div class="field">
+                <span class="label" id="lbl-count">Commands</span>
+                <div class="seg seg-count" role="group" aria-labelledby="lbl-count" data-field="count">
+                  <button type="button" data-value="100000" aria-pressed="true">100,000</button>
+                  <button type="button" data-value="1000000" aria-pressed="false">1,000,000</button>
+                  <button type="button" data-value="3000000" aria-pressed="false">3,000,000</button>
+                </div>
+              </div>
+              <div class="field field-seed">
+                <label class="label" for="seed">Seed</label>
+                <input class="input num-input" id="seed" type="number" inputmode="numeric" min="0" max="4294967295" step="1" value="42" autocomplete="off">
+              </div>
+            </div>
+            <button type="button" class="btn btn-primary btn-block" id="stress-run" disabled>Run stress test</button>
+          </div>
+          <div class="stress-out" id="stress-out" aria-busy="false">
+            <div class="stress-placeholder">
+              <p>The native Rust tests pin these digests for seed 42. Run either size to compare this browser with them.</p>
+              <table class="ref-table">
+                <caption class="visually-hidden">Native x86-64 reference digests for seed 42</caption>
+                <thead>
+                  <tr><th scope="col">Commands</th><th scope="col">Event digest</th><th scope="col">State hash</th></tr>
+                </thead>
+                <tbody>
+                  <tr><th scope="row" class="num">100,000</th><td class="num">3749b835b0ff0cae</td><td class="num">ee0bfb94bbfc39a7</td></tr>
+                  <tr><th scope="row" class="num">1,000,000</th><td class="num">f872e8139008e21f</td><td class="num">cd43f17fdee94c04</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="site-footer-inner">
+      <p>Synthetic data only. Not connected to any market.</p>
+      <p>MIT license · <a href="https://github.com/ult666666/crossbook">github.com/ult666666/crossbook</a></p>
+    </div>
+  </footer>
+
+  <div class="visually-hidden" aria-live="polite" aria-atomic="true" id="announcer"></div>
+</body>
+</html>
