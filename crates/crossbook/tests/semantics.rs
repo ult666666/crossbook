@@ -283,6 +283,19 @@ fn static_validation_runs_in_documented_order() {
 }
 
 #[test]
+fn largest_quantity_is_accepted() {
+    let mut books = Books::new();
+    let events = books.limit(1, Buy, 10, crossbook::MAX_QTY);
+    assert_eq!(
+        events,
+        [
+            accepted(1, Buy, Some(10), crossbook::MAX_QTY),
+            booked(1, Buy, 10, crossbook::MAX_QTY)
+        ]
+    );
+}
+
+#[test]
 fn ids_must_be_unique_among_live_orders_only() {
     let mut books = Books::new();
     books.limit(1, Buy, 100, 5);
