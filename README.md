@@ -10,7 +10,8 @@ implementation and compiled to WebAssembly so it runs in your browser.
 
 **[Open the playground](https://ult666666.github.io/crossbook/)**: place orders against a
 live book, step through guided scenarios, and run a million synthetic orders in your
-browser.
+browser. The [case study](https://ult666666.github.io/projects/crossbook.html) walks through
+the design, the testing and the results.
 
 ![The crossbook playground: order ticket, order book ladder with per-level queues, and event log](docs/playground.png)
 
