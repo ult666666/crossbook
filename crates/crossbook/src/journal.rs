@@ -1,4 +1,4 @@
-//! Command journals: an 8-byte header followed by [`codec`](crate::codec) frames.
+//! Command journals: an 8-byte header followed by [`codec`] frames.
 //!
 //! The engine's state is a pure function of its input, so a journal of commands is a
 //! complete record of a session. Replaying it reproduces every event and the final book;

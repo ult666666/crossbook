@@ -309,12 +309,11 @@ impl Engine {
         if self.match_taker(taker, &mut remaining, out) || remaining == 0 {
             return;
         }
+        // `rest` assigns fresh links and a new time priority.
         self.rest(
             Node {
                 price,
                 remaining,
-                prev: NIL,
-                next: NIL,
                 ..node
             },
             out,
@@ -744,5 +743,16 @@ const fn order_view(node: &Node) -> OrderView {
         remaining: node.remaining,
         stp: node.stp,
         post_only: node.post_only,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_is_compact() {
+        assert_eq!(std::mem::size_of::<Node>(), 48);
+        assert_eq!(std::mem::size_of::<Level>(), 24);
     }
 }

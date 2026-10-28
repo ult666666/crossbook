@@ -106,6 +106,8 @@ fn passive_order_rests() {
         Some((99, 10))
     );
     assert_eq!(books.fast.best_ask(), None);
+    assert!(!books.fast.is_empty());
+    assert_eq!(books.fast.len(), 1);
 }
 
 #[test]
@@ -594,6 +596,8 @@ fn depth_aggregates_levels_best_first() {
     assert_eq!(asks, [(101, 3, 1), (103, 4, 1)]);
     assert_eq!(books.fast.spread(), Some(2));
     assert_eq!(books.fast.depth(1).bids.len(), 1);
+    assert_eq!(books.fast.level_count(Buy), 2);
+    assert_eq!(books.fast.level_count(Sell), 2);
 }
 
 #[test]

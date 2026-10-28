@@ -1,0 +1,19 @@
+[package]
+name = "crossbook-cli"
+description = "Command-line tools for the crossbook matching engine: generate, replay, verify and benchmark"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "crossbook"
+path = "src/main.rs"
+doc = false
+
+[dependencies]
+crossbook = { path = "../crossbook" }
+hdrhistogram = { version = "7.5", default-features = false }
