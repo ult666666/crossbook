@@ -591,6 +591,47 @@ impl Engine {
         fingerprint.value()
     }
 
+    /// The time-priority counter: the last priority handed to a resting order.
+    pub(crate) const fn clock(&self) -> u64 {
+        self.clock
+    }
+
+    /// Visits every resting order in [`Self::snapshot`] order with its time priority.
+    pub(crate) fn for_each_with_priority(&self, mut visit: impl FnMut(OrderView, u64)) {
+        self.for_each_resting(|node| visit(order_view(node), node.priority));
+    }
+
+    /// Rebuilds a book from resting orders listed in [`Self::snapshot`] order with their
+    /// time priorities. The caller has validated them (see [`crate::snapshot::decode`]).
+    pub(crate) fn restore(clock: u64, orders: &[(OrderView, u64)]) -> Self {
+        let mut engine = Self::with_capacity(orders.len());
+        for &(view, priority) in orders {
+            let slot = u32::try_from(engine.nodes.len())
+                .ok()
+                .filter(|&slot| slot != NIL)
+                .expect("order book capacity exceeded");
+            engine.nodes.push(Node {
+                id: view.id,
+                account: view.account,
+                side: view.side,
+                price: view.price,
+                remaining: view.remaining,
+                priority,
+                stp: view.stp,
+                post_only: view.post_only,
+                prev: NIL,
+                next: NIL,
+            });
+            let level = side_book(&mut engine.bids, &mut engine.asks, view.side)
+                .entry(view.price)
+                .or_insert(Level::EMPTY);
+            link_back(level, &mut engine.nodes, slot);
+            engine.index.insert(view.id, slot);
+        }
+        engine.clock = clock;
+        engine
+    }
+
     fn for_each_resting(&self, mut visit: impl FnMut(&Node)) {
         for level in self.bids.values().rev() {
             self.walk(level, &mut visit);

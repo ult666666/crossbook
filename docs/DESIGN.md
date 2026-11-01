@@ -137,11 +137,113 @@ two engines can be compared event by event. The order of events within one comma
 part of the contract, which is why the differential tests compare whole event lists, not
 just final books.
 
+## Snapshots and recovery
+
+The engine's state is a function of its input, so durability comes down to keeping the
+input. The protocol is write-ahead logging: a command is appended to the journal before
+the engine applies it, and a snapshot records how many journaled commands its book
+includes. `recovery::recover` loads the newest snapshot, skips that many commands in the
+journal and replays the rest. Because replay is deterministic, it emits the events the
+lost process emitted and ends in the same book.
+
+A snapshot stores every resting order in book order with its time priority, plus the
+engine's priority counter. Queue order alone would reproduce the events, but storing the
+exact priorities makes a restored engine indistinguishable from the original: its next
+snapshot is byte-identical, which the tests check. The format is a 32-byte header,
+40 bytes per order and an FNV-1a checksum over everything before it. The checksum
+catches damage. `snapshot::decode` also refuses any book the engine could not have
+produced (unknown codes, a crossed book, levels or queues out of order, duplicate ids or
+priorities, a priority newer than the clock), so a snapshot from a buggy writer fails at
+load time instead of becoming a corrupt live book.
+
+Recovery distinguishes two failures. A crash in the middle of an append leaves a torn
+final frame: the input ends inside a frame. That command was never applied, so recovery
+stops before it and reports the intact length, which is where the next append must
+start. Any other decode failure, or a snapshot that claims more commands than the
+journal holds, is corruption, and recovery stops with an error instead of guessing.
+
+Recovery finds the tail by counting frames rather than storing a byte offset in the
+snapshot. Counting decodes the skipped frames, which costs time on very long journals,
+but it keeps snapshots independent of the journal's layout, and skipping and replaying
+a million commands takes about 0.15 s. The CLI writes journals without `fsync`, so it
+shows the protocol rather than a tuned storage layer; a venue would add `fsync` or group
+commit and rotate journals at each snapshot.
+
+## Market data from events
+
+Exchanges publish trades and the total quantity at each price (market by price). The
+publisher in `market_data` builds both from the event stream alone: it keeps its own
+record of every resting order from `Booked`, `Trade`, `Canceled` and `Modified` events
+and never reads the engine. That keeps publishing work off the matching path, lets the
+publisher run on a replica that only sees the event log, and tests the claim that the
+events describe every change to the book completely.
+
+For each command the publisher sends the trade prints in the order they happened, then
+one message per price level the command changed, with the level's new totals, bids
+first and best price first. Coalescing per command means a level touched several times
+by one sweep produces one message, and the sort makes the feed a deterministic function
+of the commands. On synthetic flow the feed averages 1.16 messages per command.
+
+The subscriber, `BookBuilder`, applies messages in sequence order. A sequence number
+ahead of the expected one is a gap; a heartbeat that announces the latest sequence
+number catches a gap at the end of a quiet period. After a gap the builder refuses
+messages until it resynchronizes from a snapshot of the publisher's levels, and it
+ignores messages the snapshot already includes, so buffered messages can be replayed
+safely.
+
+## Many instruments: sequencer, shards and merger
+
+One book must process its commands one at a time, but different instruments are
+independent. `exchange::run` therefore parallelizes across instruments, not within a
+book:
+
+```mermaid
+flowchart LR
+    input([commands]) --> seq["Sequencer<br/>numbers commands, cuts batches"]
+    seq -- "commands for shard 0" --> s0["Shard 0<br/>books 0, 3, 6, ..."]
+    seq -- "commands for shard 1" --> s1["Shard 1<br/>books 1, 4, 7, ..."]
+    seq -- "commands for shard 2" --> s2["Shard 2<br/>books 2, 5, 8, ..."]
+    seq -- "routing per batch" --> merge["Merger<br/>restores sequence order"]
+    s0 --> merge
+    s1 --> merge
+    s2 --> merge
+    merge --> out([events in input order])
+```
+
+Each instrument belongs to exactly one shard and each shard processes its commands in
+arrival order, so every book sees the same commands in the same order as on one thread.
+The merger follows each batch's routing to put the shards' outputs back in input order.
+The result is identical for any number of shards and any batch size; the property tests
+check this for random streams and random settings, and CI checks it on synthetic flow
+on Linux, macOS and Windows.
+
+Queues are bounded, so a slow consumer slows the sequencer instead of growing memory.
+Batching plus bounded queues can deadlock an ordered merge: if the merger waits for a
+command that sits in a batch the sequencer has not sent yet, while the sequencer waits
+for room in a full queue, nothing moves. Here a batch is a run of consecutive commands
+that is sent in full before the next one starts, and the merger always waits for the
+oldest unfinished batch, whose commands are already queued at the shards ahead of any
+later work. Some thread can therefore always make progress. Buffers travel in a loop
+(command parts back to the sequencer, event parts back to their shard, routes back to
+the sequencer) instead of being allocated per batch, and returns never block, so they
+add no waiting.
+
+Measured on a 4-core cloud VM with 64 instruments of about 2,000 resting orders each
+(see [BENCHMARKS.md](BENCHMARKS.md#many-instruments)): one thread processing every book
+manages about 3.3 million commands per second, because 64 deep books do not fit in one
+core's cache. One shard is 13 to 18% slower than that, which is the cost of copying
+commands and handing batches between threads. Two shards reach 1.6 to 1.7 times the
+single thread, and three or four shards 2.6 to 3.4 times, as the books spread over
+several cores' caches. Three or four shards plus the sequencer and the merger need more
+threads than the machine has cores, so those results vary the most. The sequencer and
+merger are serial stages, so they bound the speedup however many shards run.
+
 ## What a production system would add
 
-This is a teaching and benchmarking project, not an exchange. A real venue also needs:
-durable sequencing of input before matching, snapshots plus journal replay for recovery,
-pre-trade risk checks, market-data dissemination, multiple instruments, auctions and
-halts, price bands, fees, and operational controls such as kill switches. The event-based
-interface and the determinism guarantees are what make those pieces straightforward to
-add around this core.
+This is a learning and benchmarking project, not an exchange. A real venue also needs:
+a network gateway with authentication and pre-trade risk checks, a replicated sequencer
+so a standby can take over, `fsync` policies and journal rotation, auctions and halts,
+price bands, fees, and operational controls such as kill switches. Recovery, market data
+and multi-instrument sharding above show how the event-based interface and the
+determinism guarantees carry those pieces: each is built around the core without
+changing how it matches.

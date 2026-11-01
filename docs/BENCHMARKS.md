@@ -79,6 +79,40 @@ commands takes another 230 ms per million), and produces the same event digest a
 as the native build. Open the [playground](https://ult666666.github.io/crossbook/) to
 measure your own browser.
 
+## Many instruments
+
+`crossbook exchange` builds synthetic flow for many instruments (one generator per
+instrument, each command for a uniformly random instrument), processes it once on the
+calling thread and then through `exchange::run` with several shard counts. Every row
+must deliver exactly the single-thread output, which the command checks with a digest
+over every event in delivery order. Throughput is the median of five runs; the timed
+runs use a consumer that only touches each output, so they measure the pipeline.
+
+```bash
+cargo run --release -p crossbook-cli -- exchange --orders 3000000 --runs 5
+```
+
+Three million commands across 64 instruments of about 2,000 resting orders each, batches
+of 4,096 commands, on a 4-vCPU cloud VM (Intel Xeon at 2.8 GHz, 1 MB of L2 cache per
+core, no pinning). The command ran three times; each cell gives the range of the three
+medians:
+
+| Threads for books | Commands per second | Versus one thread |
+| --- | ---: | ---: |
+| One thread, no pipeline | 3.2 to 3.4 million | 1.00x |
+| 1 shard | 2.8 to 2.9 million | 0.82 to 0.87x |
+| 2 shards | 5.4 to 5.7 million | 1.63 to 1.74x |
+| 3 shards | 8.6 to 10.4 million | 2.58 to 3.15x |
+| 4 shards | 9.3 to 10.8 million | 2.77 to 3.38x |
+
+Every row of every run produced the output digest `c56702ca7d22374d`. The single-thread
+rate is far below the one-book benchmark above because 64 deep books do not fit in one
+core's cache; spreading them over several cores' caches offsets part of the pipeline's
+cost. With three or four shards, the shards plus the sequencer and the merger need five
+or six threads on four cores, so those rows vary the most between runs.
+[DESIGN.md](DESIGN.md#many-instruments-sequencer-shards-and-merger) explains the
+pipeline.
+
 ## Reproducing on GitHub's runners
 
 The `Benchmark` workflow (`.github/workflows/bench.yml`, run manually) builds the CLI and
