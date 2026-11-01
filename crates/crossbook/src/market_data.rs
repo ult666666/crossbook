@@ -452,11 +452,27 @@ mod tests {
 
     #[test]
     fn a_sweep_prints_trades_then_updated_levels() {
-        let (_, _, batches) = run(&[
+        let (engine, _, batches) = run(&[
             Command::New(NewOrder::limit(1, Side::Sell, 101, 5)),
             Command::New(NewOrder::limit(2, Side::Sell, 102, 5)),
             Command::New(NewOrder::limit(3, Side::Buy, 102, 7)),
         ]);
+        let mut builder = BookBuilder::new();
+        assert_eq!(
+            (
+                builder.is_synced(),
+                builder.next_seq(),
+                builder.last_trade()
+            ),
+            (true, 1, None)
+        );
+        for message in batches.concat() {
+            builder.apply(&message).unwrap();
+        }
+        assert_eq!(builder.next_seq(), 7);
+        assert!(builder.is_synced());
+        assert_eq!(builder.last_trade(), Some((102, 2, Side::Buy)));
+        assert_eq!(builder.depth(usize::MAX), engine.depth(usize::MAX));
         assert_eq!(
             batches[2],
             [
@@ -569,6 +585,8 @@ mod tests {
             "refuses until resync"
         );
         builder.resync(&publisher.snapshot());
+        assert!(builder.is_synced());
+        assert_eq!(builder.next_seq(), publisher.seq() + 1);
         for message in &messages {
             builder.apply(message).unwrap(); // already included, so ignored
         }

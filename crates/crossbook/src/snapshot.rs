@@ -311,10 +311,16 @@ mod tests {
             decode(&version).unwrap_err(),
             SnapshotError::UnsupportedVersion(9)
         );
-        assert!(matches!(
-            decode(&bytes[..20]),
-            Err(SnapshotError::Truncated { .. })
-        ));
+        let truncated = |available| SnapshotError::Truncated {
+            needed: HEADER_LEN + CHECKSUM_LEN,
+            available,
+        };
+        assert_eq!(decode(&MAGIC).unwrap_err(), truncated(8));
+        assert_eq!(decode(&bytes[..20]).unwrap_err(), truncated(20));
+        assert_eq!(
+            decode(&bytes[..HEADER_LEN + CHECKSUM_LEN - 1]).unwrap_err(),
+            truncated(HEADER_LEN + CHECKSUM_LEN - 1)
+        );
         for position in [9, HEADER_LEN + 3, bytes.len() - 1] {
             let mut flipped = bytes.clone();
             flipped[position] ^= 0x40;
@@ -354,6 +360,26 @@ mod tests {
         queue[at(1, 16)..at(1, 24)].copy_from_slice(&99i64.to_le_bytes());
         queue[at(1, 32)..at(1, 40)].copy_from_slice(&1u64.to_le_bytes());
         assert_eq!(reseal(queue), out_of_order);
+        for remaining in [0, MAX_QTY + 1] {
+            let mut open = bytes.clone();
+            open[at(1, 24)..at(1, 32)].copy_from_slice(&remaining.to_le_bytes());
+            assert_eq!(
+                reseal(open),
+                SnapshotError::InvalidOrder {
+                    index: 1,
+                    reason: "open quantity is out of range"
+                }
+            );
+        }
+        let mut late_bid = bytes.clone();
+        late_bid[at(3, 12)] = 0; // The last ask turns into a bid.
+        assert_eq!(
+            reseal(late_bid),
+            SnapshotError::InvalidOrder {
+                index: 3,
+                reason: "bid listed after an ask"
+            }
+        );
         let mut future = bytes.clone();
         future[at(3, 32)..at(3, 40)].copy_from_slice(&999u64.to_le_bytes());
         assert!(matches!(
