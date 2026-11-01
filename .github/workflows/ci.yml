@@ -40,6 +40,14 @@ jobs:
           PROPTEST_CASES: ${{ runner.os == 'Linux' && '4096' || '512' }}
       - name: Differential check on one million synthetic commands
         run: cargo run --release -p crossbook-cli -- verify --orders 1000000 --seed 7
+      - name: Same output for every shard count
+        run: cargo run --release -p crossbook-cli -- exchange --orders 300000 --symbols 32 --shards 1,2,3,4,7 --runs 1
+      - name: Crash recovery on one million commands
+        if: runner.os == 'Linux'
+        run: scripts/check-recovery.sh 1000000 42
+      - name: Market data rebuilt from the feed on one million commands
+        if: runner.os == 'Linux'
+        run: cargo run --release -p crossbook-cli -- feed --orders 1000000
       - name: Documentation
         if: runner.os == 'Linux'
         run: cargo doc --workspace --no-deps

@@ -13,12 +13,17 @@ different way to be wrong.
 | Long synthetic sessions | `crates/crossbook/tests/flow.rs`, `crossbook verify` | Bugs that need a deep, realistic book to show up |
 | Golden digests | `flow.rs`, CI on three platforms, WebAssembly check | Any change in behavior, and any platform dependence |
 | Codec properties | `crates/crossbook/tests/codec.rs` | Encoding round trips; malformed bytes never panic |
+| Crash recovery | `crates/crossbook/tests/recovery.rs`, `scripts/check-recovery.sh` | Recovery that loses, repeats or changes a command; snapshots that misread damaged bytes |
+| Market data | `crates/crossbook/tests/market_data.rs` | A feed whose rebuilt book drifts from the engine; lost messages that go unnoticed |
+| Shard independence | `crates/crossbook/tests/exchange.rs`, `crossbook exchange` | Any output that depends on the number of threads, the batch size or timing |
 | Browser smoke test | `web/smoke.mjs` | The playground loads, runs scenarios and the stress test |
 | Mutation testing | `cargo mutants` | Tests that pass no matter what the code does |
 
 Run everything locally with `cargo test --workspace`. CI also runs 4,096 property cases,
-a one-million-command differential check, the WebAssembly comparison and the browser
-smoke test.
+a one-million-command differential check, the WebAssembly comparison, crash recovery on
+one million commands, the shard check on three operating systems and the browser smoke
+test. The generators for random command streams live in `tests/common/mod.rs` and are
+shared by every property test.
 
 ## Two implementations of one spec
 
@@ -71,6 +76,48 @@ platform-dependent result fails the build. `scripts/check-determinism.sh` builds
 engine for `wasm32-unknown-unknown`, runs one million commands under Node.js, and
 requires the same digests as the native CLI. The browser playground shows the same
 reference digests and compares them live.
+
+## Crash recovery
+
+`tests/recovery.rs` simulates a crash for every random command stream. The session runs
+uninterrupted while its journal is written and a snapshot is taken every few commands.
+Then the journal is cut at a random byte, as if the process died in the middle of an
+append, and recovery starts from the newest snapshot the surviving journal covers. The
+recovered engine must hold exactly the book the uninterrupted run held after the same
+number of commands, pass `check_invariants`, report the torn bytes exactly, and the
+replayed tail must emit the same events, in order.
+
+Two more properties: an engine restored from a snapshot behaves exactly like the
+original for any later commands, and its own next snapshot is byte-identical; and
+flipping any byte of a snapshot makes decoding fail instead of producing a different
+book. (FNV-1a turns a change to any one byte into a different checksum, so this holds
+for every position.) Random bytes never make the decoder panic.
+
+`scripts/check-recovery.sh` repeats the check through the CLI on one million commands:
+a snapshot at 40% plus the rest of the journal must reach the full replay's state hash,
+recovery without a snapshot must emit the full replay's event digest, and a journal cut
+inside its last frame must lose exactly that command.
+
+## Market data
+
+`tests/market_data.rs` runs random streams through the engine and the publisher and
+feeds every message to a subscriber. After every command the subscriber's book must
+equal `Engine::depth` level by level, the trade prints must mirror the trade events, and
+sequence numbers must have no gaps. A second property drops one random message and
+requires the subscriber to notice by the end of that command, from a later message or
+the heartbeat, and to hold the engine's book again after resynchronizing. A 40,000
+command synthetic session checks deep books and sweeps across many levels, and
+`crossbook feed` repeats the check on one million commands.
+
+## Shard independence
+
+`tests/exchange.rs` runs random multi-instrument streams through `exchange::run` with a
+random shard count, batch size and queue length, and requires exactly the output of one
+thread processing the commands in order: the same events, for the same instruments, in
+the same order. A synthetic session over 24 instruments must give the same digest with
+1, 2, 3, 4 and 7 shards and batch sizes from 1 to 4,096. CI also runs
+`crossbook exchange` on Linux, macOS and Windows, where thread scheduling differs, and
+the command fails if any shard count changes the digest.
 
 ## Mutation testing
 

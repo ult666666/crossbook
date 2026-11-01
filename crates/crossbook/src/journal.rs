@@ -103,6 +103,12 @@ impl<R: BufRead> Reader<R> {
         })
     }
 
+    /// Bytes read so far, header included: the end of the last complete frame.
+    #[must_use]
+    pub const fn offset(&self) -> u64 {
+        self.offset
+    }
+
     fn next_frame(&mut self) -> Result<Option<Command>, JournalError> {
         let mut frame = [0u8; NEW_LEN];
         if self.inner.read(&mut frame[..1])? == 0 {

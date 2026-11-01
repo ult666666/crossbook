@@ -8,76 +8,13 @@
 //!
 //! Set `PROPTEST_CASES` to change the number of streams (CI runs 4096).
 
+mod common;
+
+use common::{command, config};
 use crossbook::reference::ReferenceEngine;
-use crossbook::{
-    CancelReason, Command, Engine, Event, MAX_QTY, NewOrder, OrderKind, Side, StpMode, TimeInForce,
-};
+use crossbook::{CancelReason, Command, Engine, Event, Side};
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
-
-fn side() -> impl Strategy<Value = Side> {
-    prop_oneof![Just(Side::Buy), Just(Side::Sell)]
-}
-
-fn price() -> impl Strategy<Value = i64> {
-    prop_oneof![40 => 95i64..=105, 1 => Just(0), 1 => Just(-3)]
-}
-
-fn qty() -> impl Strategy<Value = u64> {
-    prop_oneof![40 => 1u64..=12, 1 => Just(0), 1 => Just(MAX_QTY), 1 => Just(MAX_QTY + 1)]
-}
-
-fn new_order() -> impl Strategy<Value = NewOrder> {
-    let kind = prop_oneof![9 => price().prop_map(OrderKind::Limit), 1 => Just(OrderKind::Market)];
-    let tif = prop_oneof![6 => Just(TimeInForce::Gtc), 2 => Just(TimeInForce::Ioc), 2 => Just(TimeInForce::Fok)];
-    let stp = prop_oneof![
-        4 => Just(StpMode::Allow),
-        1 => Just(StpMode::CancelNewest),
-        1 => Just(StpMode::CancelOldest),
-        1 => Just(StpMode::CancelBoth),
-    ];
-    (
-        1u64..=30,
-        1u32..=3,
-        side(),
-        kind,
-        qty(),
-        tif,
-        prop::bool::weighted(0.15),
-        stp,
-    )
-        .prop_map(
-            |(id, account, side, kind, qty, tif, post_only, stp)| NewOrder {
-                id,
-                account,
-                side,
-                kind,
-                qty,
-                tif,
-                post_only,
-                stp,
-            },
-        )
-}
-
-fn command() -> impl Strategy<Value = Command> {
-    prop_oneof![
-        6 => new_order().prop_map(Command::New),
-        2 => (1u64..=30).prop_map(|id| Command::Cancel { id }),
-        2 => (1u64..=30, price(), qty()).prop_map(|(id, price, qty)| Command::Modify { id, price, qty }),
-    ]
-}
-
-fn config() -> ProptestConfig {
-    let cases = std::env::var("PROPTEST_CASES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1024);
-    ProptestConfig {
-        cases,
-        ..ProptestConfig::default()
-    }
-}
 
 /// Checks that one command's events account for every lot it entered.
 fn check_accounting(command: &Command, events: &[Event]) -> Result<(), TestCaseError> {

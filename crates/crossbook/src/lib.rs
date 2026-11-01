@@ -12,6 +12,15 @@
 //! - **Checked two ways.** [`reference::ReferenceEngine`] implements the same rules with
 //!   linear scans; property tests require both engines to agree on every event.
 //!
+//! Around the engine, built on its event stream and its determinism:
+//!
+//! - [`snapshot`] and [`recovery`]: checksummed snapshots and a write-ahead journal that
+//!   rebuild the book exactly after a crash.
+//! - [`market_data`]: trade prints and price-level updates derived from events, and a
+//!   subscriber that detects gaps and resynchronizes.
+//! - [`exchange`]: many instruments on several threads, with output identical to one
+//!   thread.
+//!
 //! ```
 //! use crossbook::{CancelReason, Command, Engine, Event, NewOrder, Side, TimeInForce};
 //!
@@ -36,9 +45,13 @@
 pub mod codec;
 pub mod digest;
 mod engine;
+pub mod exchange;
 pub mod flow;
 pub mod journal;
+pub mod market_data;
+pub mod recovery;
 pub mod reference;
+pub mod snapshot;
 mod types;
 
 pub use engine::Engine;
