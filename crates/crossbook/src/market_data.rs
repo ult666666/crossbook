@@ -452,11 +452,27 @@ mod tests {
 
     #[test]
     fn a_sweep_prints_trades_then_updated_levels() {
-        let (_, _, batches) = run(&[
+        let (engine, _, batches) = run(&[
             Command::New(NewOrder::limit(1, Side::Sell, 101, 5)),
             Command::New(NewOrder::limit(2, Side::Sell, 102, 5)),
             Command::New(NewOrder::limit(3, Side::Buy, 102, 7)),
         ]);
+        let mut builder = BookBuilder::new();
+        assert_eq!(
+            (
+                builder.is_synced(),
+                builder.next_seq(),
+                builder.last_trade()
+            ),
+            (true, 1, None)
+        );
+        for message in batches.concat() {
+            builder.apply(&message).unwrap();
+        }
+        assert_eq!(builder.next_seq(), 7);
+        assert!(builder.is_synced());
+        assert_eq!(builder.last_trade(), Some((102, 2, Side::Buy)));
+        assert_eq!(builder.depth(usize::MAX), engine.depth(usize::MAX));
         assert_eq!(
             batches[2],
             [
@@ -500,6 +516,49 @@ mod tests {
         assert_eq!(publisher.seq(), 0);
     }
 
+    fn trade(maker: OrderId, taker_side: Side, price: Price) -> Event {
+        Event::Trade {
+            taker: 99,
+            maker,
+            taker_side,
+            price,
+            qty: 1,
+            taker_remaining: 0,
+            maker_remaining: 4,
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "which rests as")]
+    fn a_trade_against_an_order_on_the_same_side_is_refused() {
+        let mut publisher = Publisher::new();
+        let mut out = Vec::new();
+        let booked = Event::Booked {
+            id: 1,
+            side: Side::Buy,
+            price: 100,
+            qty: 5,
+        };
+        publisher.publish(&[booked], &mut out);
+        // An incoming buy can only trade against a resting sell.
+        publisher.publish(&[trade(1, Side::Buy, 100)], &mut out);
+    }
+
+    #[test]
+    #[should_panic(expected = "which rests as")]
+    fn a_trade_at_another_price_than_the_resting_order_is_refused() {
+        let mut publisher = Publisher::new();
+        let mut out = Vec::new();
+        let booked = Event::Booked {
+            id: 1,
+            side: Side::Sell,
+            price: 100,
+            qty: 5,
+        };
+        publisher.publish(&[booked], &mut out);
+        publisher.publish(&[trade(1, Side::Buy, 101)], &mut out);
+    }
+
     #[test]
     fn gaps_are_detected_and_repaired_from_a_snapshot() {
         let (engine, publisher, batches) = run(&[
@@ -526,6 +585,8 @@ mod tests {
             "refuses until resync"
         );
         builder.resync(&publisher.snapshot());
+        assert!(builder.is_synced());
+        assert_eq!(builder.next_seq(), publisher.seq() + 1);
         for message in &messages {
             builder.apply(message).unwrap(); // already included, so ignored
         }

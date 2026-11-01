@@ -180,7 +180,12 @@ where
     })
 }
 
-const fn shard_of(symbol: Symbol, shards: usize) -> usize {
+/// The shard that owns instrument `symbol` when `shards` shards run: `symbol % shards`.
+///
+/// # Panics
+/// Panics if `shards` is zero.
+#[must_use]
+pub const fn shard_of(symbol: Symbol, shards: usize) -> usize {
     symbol as usize % shards
 }
 
@@ -329,6 +334,13 @@ mod tests {
             assert!(matches!(seen[3].2[..], [Event::Rejected { id: 1, .. }]));
             assert!(matches!(seen[4].2[..], [Event::Canceled { id: 1, .. }]));
         }
+    }
+
+    #[test]
+    fn instruments_spread_over_shards_round_robin() {
+        let owners: Vec<usize> = (0..7).map(|symbol| shard_of(symbol, 3)).collect();
+        assert_eq!(owners, [0, 1, 2, 0, 1, 2, 0]);
+        assert_eq!(shard_of(u32::MAX, 1), 0);
     }
 
     #[test]

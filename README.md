@@ -44,7 +44,7 @@ the design, the testing and the results.
 | Latency per command, p50 / p99 / p99.9 | 64 ns / 196 ns / 477 ns |
 | Same session compiled to WebAssembly (Node.js) | about 8.3 million commands per second, with the same event digest and state hash as the native build |
 | Differential tests against the reference model | 1,024 random command streams per local run, 4,096 in CI, plus a one-million-command check |
-| Mutation testing (cargo-mutants) | 140 of 148 compiling mutants caught. Of the 8 survivors, 4 are now covered by new assertions, 2 pointed at redundant code that was deleted, and 2 only drop a capacity hint |
+| Mutation testing (cargo-mutants) | Engine: 140 of 148 compiling mutants caught; of the 8 survivors, 4 are now covered by new assertions, 2 pointed at redundant code that was deleted, and 2 only drop a capacity hint. Recovery, market data and sharding: 165 of 175 caught after closing 14 gaps; the 10 survivors only change buffer recycling or comparisons where equality is already ruled out |
 | Crash recovery, one million commands | A snapshot at 400,000 commands plus the journal tail reaches the full replay's state hash; loading it and replaying 600,000 commands takes about 0.15 s |
 | Market data, one million commands | The book rebuilt from the feed alone equals the engine's; 1.16 messages per command |
 | 64 instruments on a 4-core VM | 2.6 to 3.4 times the single-thread rate with 3 or 4 shards, with identical output for every shard count |

@@ -191,6 +191,26 @@ mod tests {
     }
 
     #[test]
+    fn errors_expose_their_cause() {
+        use std::error::Error as _;
+        let snapshot = RecoveryError::from(SnapshotError::BadMagic);
+        assert_eq!(
+            snapshot.source().map(ToString::to_string),
+            Some(SnapshotError::BadMagic.to_string())
+        );
+        assert!(
+            RecoveryError::from(JournalError::BadMagic)
+                .source()
+                .is_some()
+        );
+        let behind = RecoveryError::JournalBehindSnapshot {
+            snapshot: 2,
+            journal: 1,
+        };
+        assert!(behind.source().is_none());
+    }
+
+    #[test]
     fn a_torn_final_frame_is_ignored_but_damage_is_not() {
         let commands = session();
         let mut journal = Vec::new();
