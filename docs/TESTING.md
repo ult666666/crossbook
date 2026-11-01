@@ -155,6 +155,26 @@ cargo mutants -p crossbook --file crates/crossbook/src/engine.rs \
   --exclude-re 'IdHasher|with_capacity|check_invariants|fmt'
 ```
 
+**The 0.2 modules.** A second run covered `snapshot.rs`, `recovery.rs`,
+`market_data.rs` and `exchange.rs`: 182 mutants, 7 of which did not compile. The first
+pass caught 151 of the other 175. The 24 survivors pointed at 14 real gaps, among them
+routing every instrument to one shard (correct output, no parallelism), a publisher
+check weakened so that a trade could hit an order on the wrong side or at another price,
+the subscriber's sequence and sync accessors, the cause chained by recovery errors, and
+exact snapshot length boundaries. Tests now cover all 14, and the rerun caught 165 of
+175. The 10 survivors:
+
+- 7 in `exchange::run` change only buffer recycling or the capacity of the queues that
+  return spare buffers: the output is identical, only allocation changes;
+- 3 in `snapshot::decode` turn `<` into `<=` (or `>` into `>=`) where equality was
+  already rejected by an earlier check, so they cannot change a result.
+
+```bash
+cargo mutants -p crossbook --file crates/crossbook/src/snapshot.rs \
+  --file crates/crossbook/src/recovery.rs --file crates/crossbook/src/market_data.rs \
+  --file crates/crossbook/src/exchange.rs --exclude-re 'fmt|Display|SymbolHasher'
+```
+
 ## Browser smoke test
 
 `web/smoke.mjs` serves the playground, loads it in headless Chromium, fails on any
