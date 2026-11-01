@@ -178,7 +178,8 @@ pub fn decode(bytes: &[u8]) -> Result<(Engine, u64), SnapshotError> {
     let mut priorities = HashSet::with_capacity(orders.capacity());
     let mut previous: Option<(Side, Price, u64)> = None;
     let mut best_bid = None;
-    for (index, record) in (0u64..).zip(records.chunks_exact(RECORD_LEN)) {
+    let (records, _) = records.as_chunks::<RECORD_LEN>();
+    for (index, record) in (0u64..).zip(records) {
         let invalid = |reason| SnapshotError::InvalidOrder { index, reason };
         let side = match record[12] {
             0 => Side::Buy,
