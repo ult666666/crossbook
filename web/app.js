@@ -1107,9 +1107,19 @@ document.addEventListener('keydown', (event) => {
   renderSelection();
 });
 
-ui.startCall.addEventListener('click', () => execute({ op: 'startCall' }));
-ui.uncross.addEventListener('click', () => execute({ op: 'uncross' }));
-ui.resume.addEventListener('click', () => execute({ op: 'resume' }));
+// Starting a call or resuming hides the button that did it. Move focus to the phase
+// control that is now shown, so keyboard and screen-reader users keep their place.
+function phaseCommand(op, button) {
+  const hadFocus = document.activeElement === button;
+  execute({ op });
+  if (!hadFocus || !button.hidden) return;
+  const next = [ui.uncross, ui.startCall].find((control) => !control.hidden);
+  next?.focus();
+}
+
+ui.startCall.addEventListener('click', () => phaseCommand('startCall', ui.startCall));
+ui.uncross.addEventListener('click', () => phaseCommand('uncross', ui.uncross));
+ui.resume.addEventListener('click', () => phaseCommand('resume', ui.resume));
 
 ui.clearBook.addEventListener('click', () => {
   resetEngine();

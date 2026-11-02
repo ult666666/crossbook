@@ -3,6 +3,17 @@
 All notable changes to crossbook. The project follows [Semantic Versioning](https://semver.org/);
 before 1.0, a minor version may change the public API.
 
+## Unreleased
+
+### Fixed
+
+- Playground: the first click on the order button right after typing a price or quantity
+  could place no order. Leaving the field redrew the button's label under the pointer, and
+  a click that started on a number in the label lost its target. The bug dates from 0.1.
+- Playground: starting a call phase or resuming continuous trading with the keyboard
+  dropped focus to the top of the page, because the button hides itself. Focus now moves
+  to the phase control that replaces it.
+
 ## 0.3.0 (2026-11-02)
 
 ### Added

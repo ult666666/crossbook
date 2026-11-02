@@ -274,6 +274,8 @@ PROPTEST_CASES=32 CROSSBOOK_FLOW_COMMANDS=12000 cargo mutants -p crossbook --job
 
 `web/smoke.mjs` serves the playground, loads it in headless Chromium, fails on any
 console error, runs a guided scenario, runs the opening-auction scenario (the indicative
-uncross, five auction trades at 101 and the return to continuous trading), places and
-cancels an order through the UI, runs the 100,000-command stress test and checks the
+uncross, five auction trades at 101 and the return to continuous trading), checks that
+the phase buttons hand keyboard focus to the next phase control, places and cancels an
+order through the UI, checks that the first click on the order button right after typing
+a quantity places the order, runs the 100,000-command stress test and checks the
 native-match confirmation, and checks for horizontal overflow at phone width.

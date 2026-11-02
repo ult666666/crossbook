@@ -61,8 +61,8 @@ pub enum Message {
         /// The auction's reference price in a call phase.
         reference: Option<Price>,
     },
-    /// The result of an uncross: one print for every lot that changed hands at the clearing
-    /// price. `price` is `None` when nothing could execute.
+    /// The result of an uncross: a single print that covers all the lots that changed hands
+    /// at the clearing price. `price` is `None` when nothing could execute.
     Auction {
         /// Sequence number.
         seq: u64,
