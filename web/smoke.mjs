@@ -115,6 +115,25 @@ async function main() {
       await page.waitForFunction(() => /2 trades for 8 lots/.test(document.getElementById('announcer').textContent));
     });
 
+    await step('auction scenario uncrosses at one price, then resumes', async () => {
+      await page.click('#scenario-list button[data-id="auction"]');
+      await page.waitForFunction(() => document.getElementById('phase-label').textContent.startsWith('Call phase'));
+      const indicative = (await page.textContent('#indicative')).replace(/\s+/g, ' ').trim();
+      check(indicative.includes('13 lots at 101'), `unexpected indicative uncross: "${indicative}"`);
+      check((await page.locator('.level.is-market .chip').count()) === 1, 'the market order is not shown');
+      await page.click('#sc-action');
+      await page.waitForFunction(
+        () => document.querySelectorAll('#log-list > li:first-child .event[data-type="auction-trade"]').length === 5,
+        null,
+        { timeout: 5_000 },
+      );
+      const summary = (await page.textContent('#log-list > li:first-child .event[data-type="uncrossed"]')).replace(/\s+/g, ' ');
+      check(summary.includes('13 lots at 101'), `unexpected uncross summary: "${summary}"`);
+      await page.click('#sc-follow');
+      await page.waitForFunction(() => document.getElementById('phase-label').textContent === 'Continuous trading');
+      check(!(await page.isHidden('#start-call')) && (await page.isHidden('#uncross-btn')), 'phase buttons did not switch');
+    });
+
     let orderId = '';
     await step('ticket places an order that rests on the book', async () => {
       await page.click('[data-field="side"] button[data-value="sell"]');

@@ -3,15 +3,15 @@
 //! Spreading instruments over threads must not change anything a participant can see:
 //! for any shard count, batch size and queue length, [`exchange::run`] must deliver
 //! exactly the events that one thread processing the commands in order produces, in the
-//! same order.
+//! same order. The commands include each instrument's own call phases and uncrosses.
 
 mod common;
 
 use std::collections::HashMap;
 
-use common::{command, config};
+use common::{config, session_command};
 use crossbook::exchange::{self, Config, Symbol};
-use crossbook::flow::{Flow, FlowConfig, SplitMix64};
+use crossbook::flow::{Flow, FlowConfig, Schedule, SplitMix64};
 use crossbook::{Command, Engine, Event, digest::Fingerprint};
 use proptest::prelude::*;
 
@@ -34,7 +34,7 @@ proptest! {
 
     #[test]
     fn sharded_output_equals_one_thread(
-        commands in prop::collection::vec((0u32..7, command()), 1..300),
+        commands in prop::collection::vec((0u32..7, session_command()), 1..300),
         shards in 1usize..6,
         batch in 1usize..40,
         queue in 1usize..4,
@@ -54,12 +54,23 @@ proptest! {
     }
 }
 
-/// Many deep books with realistic flow: the same digest for every shard count.
+/// Many deep books with realistic flow, each with its own opening and closing auctions:
+/// the same digest for every shard count.
 #[test]
 fn synthetic_multi_instrument_session_is_shard_independent() {
     let symbols = 24u32;
+    let session = Some(Schedule {
+        opening_call: 300,
+        continuous: 5_000,
+        closing_call: 300,
+    });
     let mut flows: Vec<Flow> = (0..symbols)
-        .map(|symbol| Flow::new(FlowConfig::seeded(1_000 + u64::from(symbol))))
+        .map(|symbol| {
+            Flow::new(FlowConfig {
+                session,
+                ..FlowConfig::seeded(1_000 + u64::from(symbol))
+            })
+        })
         .collect();
     let mut pick = SplitMix64::new(99);
     let commands: Vec<(Symbol, Command)> = (0..150_000)
@@ -90,6 +101,15 @@ fn synthetic_multi_instrument_session_is_shard_independent() {
         );
         fingerprint.value()
     };
+    let auctions = one_thread(&commands)
+        .iter()
+        .flat_map(|(_, _, events)| events)
+        .filter(|event| matches!(event, Event::Uncrossed { volume, .. } if *volume > 0))
+        .count();
+    assert!(
+        auctions >= 2 * symbols as usize,
+        "only {auctions} uncrosses executed"
+    );
     let reference = digest(1, 1024);
     for (shards, batch) in [(2, 1024), (3, 100), (4, 4096), (7, 1)] {
         assert_eq!(

@@ -131,6 +131,14 @@
         <button type="button" class="btn btn-quiet btn-small" id="clear-book" disabled>Clear book</button>
       </div>
       <p class="panel-note">Select a price to copy it to the ticket, or an order to cancel or modify it.</p>
+      <div class="phase-bar" id="phase-bar" data-phase="continuous">
+        <p class="phase-status" aria-live="polite"><span class="phase-dot" aria-hidden="true"></span><span id="phase-label">Continuous trading</span></p>
+        <div class="phase-actions">
+          <button type="button" class="btn btn-small" id="start-call" disabled>Start call auction</button>
+          <button type="button" class="btn btn-small" id="uncross-btn" hidden>Uncross</button>
+          <button type="button" class="btn btn-small" id="resume-btn" hidden>Resume trading</button>
+        </div>
+      </div>
       <div class="ladder" id="ladder" aria-busy="true">
         <div class="ladder-cols" aria-hidden="true">
           <span>Side</span><span class="right">Price</span><span class="right">Lots</span><span>Queue, oldest first</span>
@@ -238,6 +246,13 @@
                   <button type="button" data-value="3000000" aria-pressed="false">3,000,000</button>
                 </div>
               </div>
+              <div class="field">
+                <span class="label" id="lbl-session">Session</span>
+                <div class="seg" role="group" aria-labelledby="lbl-session" data-field="session">
+                  <button type="button" data-value="continuous" aria-pressed="true">Continuous</button>
+                  <button type="button" data-value="auctions" aria-pressed="false">With auctions</button>
+                </div>
+              </div>
               <div class="field field-seed">
                 <label class="label" for="seed">Seed</label>
                 <input class="input num-input" id="seed" type="number" inputmode="numeric" min="0" max="4294967295" step="1" value="42" autocomplete="off">
@@ -247,7 +262,7 @@
           </div>
           <div class="stress-out" id="stress-out" aria-busy="false">
             <div class="stress-placeholder">
-              <p>The native Rust tests pin these digests for seed 42. Run either size to compare this browser with them.</p>
+              <p>The native Rust build produces these digests for seed 42. Run either size to compare this browser with them. With auctions, each simulated day opens and closes with a call auction.</p>
               <table class="ref-table">
                 <caption class="visually-hidden">Native x86-64 reference digests for seed 42</caption>
                 <thead>
@@ -256,6 +271,8 @@
                 <tbody>
                   <tr><th scope="row" class="num">100,000</th><td class="num">3749b835b0ff0cae</td><td class="num">ee0bfb94bbfc39a7</td></tr>
                   <tr><th scope="row" class="num">1,000,000</th><td class="num">f872e8139008e21f</td><td class="num">cd43f17fdee94c04</td></tr>
+                  <tr><th scope="row"><span class="num">100,000</span> with auctions</th><td class="num">a5bb1e7ca4448d51</td><td class="num">d0a536b7a64fb055</td></tr>
+                  <tr><th scope="row"><span class="num">1,000,000</span> with auctions</th><td class="num">e51f304f84984e6e</td><td class="num">805a6d40078c9151</td></tr>
                 </tbody>
               </table>
             </div>

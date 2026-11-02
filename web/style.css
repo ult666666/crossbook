@@ -381,6 +381,60 @@ a {
   font-size: 12.5px;
 }
 
+/* Trading phase: continuous trading, or an auction call phase with its controls. */
+
+.phase-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s2) var(--s3);
+  padding: var(--s3) var(--s4) 0;
+}
+
+.phase-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  color: var(--ink-2);
+  font-size: 12.5px;
+  font-weight: 650;
+}
+
+.phase-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--bid);
+}
+
+.phase-bar[data-phase='call'] .phase-dot {
+  background: var(--warn);
+}
+
+.phase-bar[data-phase='call'] .phase-status {
+  color: var(--warn);
+}
+
+.phase-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s2);
+}
+
+.level.is-market .level-price {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  color: var(--ink-3);
+}
+
+.level-btn.is-static:hover {
+  background: transparent;
+}
+
 .empty-note {
   margin: 0;
   color: var(--ink-3);
@@ -1507,6 +1561,20 @@ input[type='number']::-webkit-outer-spin-button {
 
 .tag-modified {
   border-color: var(--info);
+  color: var(--info);
+}
+
+.tag-auction-trade {
+  background: var(--ink);
+  border-color: var(--ink);
+  color: var(--panel);
+}
+
+.tag-call-started,
+.tag-uncrossed,
+.tag-resumed {
+  border-color: var(--info);
+  background: var(--panel-2);
   color: var(--info);
 }
 

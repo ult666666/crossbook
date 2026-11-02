@@ -8,15 +8,22 @@
 //! [`BookSnapshot`]. The tests check after every command that a subscriber's book equals
 //! the engine's.
 //!
-//! For each command the publisher sends the trade prints first, in the order they
-//! happened, then one message per price level the command changed, carrying the level's
-//! new totals. A total of zero removes the level. Level messages are sorted bids first,
-//! best price first, so the feed is a deterministic function of the commands.
+//! For each command the publisher sends the trade prints, auction results and phase
+//! changes first, in the order they happened, then one message per price level the command
+//! changed, carrying the level's new totals. A total of zero removes the level. Level
+//! messages are sorted bids first, best price first, so the feed is a deterministic
+//! function of the commands.
+//!
+//! Through a call phase the levels may cross, and market orders wait outside every level,
+//! so the feed shows only limit levels, as [`crate::Engine::depth`] does. An uncross is one
+//! [`Message::Auction`] print with the clearing price, volume and surplus, followed by the
+//! levels it changed; the individual auction fills are executions for their owners, not
+//! public prints.
 
 use core::fmt;
 use std::collections::{BTreeMap, HashMap};
 
-use crate::types::{Depth, Event, LevelView, OrderId, Price, Qty, Side};
+use crate::types::{Depth, Event, LevelView, OrderId, Phase, Price, Qty, Side, UncrossSummary};
 
 /// One market-data message. Sequence numbers start at 1 and have no gaps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,6 +52,23 @@ pub enum Message {
         /// Number of resting orders.
         orders: u32,
     },
+    /// The book entered a call phase or returned to continuous trading.
+    Status {
+        /// Sequence number.
+        seq: u64,
+        /// The new phase.
+        phase: Phase,
+        /// The auction's reference price in a call phase.
+        reference: Option<Price>,
+    },
+    /// The result of an uncross: one print for every lot that changed hands at the clearing
+    /// price. `price` is `None` when nothing could execute.
+    Auction {
+        /// Sequence number.
+        seq: u64,
+        /// Clearing price, volume and surplus.
+        result: UncrossSummary,
+    },
 }
 
 impl Message {
@@ -52,7 +76,10 @@ impl Message {
     #[must_use]
     pub const fn seq(&self) -> u64 {
         match *self {
-            Self::Trade { seq, .. } | Self::Level { seq, .. } => seq,
+            Self::Trade { seq, .. }
+            | Self::Level { seq, .. }
+            | Self::Status { seq, .. }
+            | Self::Auction { seq, .. } => seq,
         }
     }
 }
@@ -65,6 +92,8 @@ pub struct BookSnapshot {
     pub seq: u64,
     /// All levels, best price first on each side.
     pub depth: Depth,
+    /// The trading phase.
+    pub phase: Phase,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -77,10 +106,13 @@ struct Totals {
 #[derive(Clone, Debug, Default)]
 pub struct Publisher {
     resting: HashMap<OrderId, (Side, Price, Qty)>,
+    /// Market orders waiting for an uncross; they belong to no level.
+    market: HashMap<OrderId, (Side, Qty)>,
     bids: BTreeMap<Price, Totals>,
     asks: BTreeMap<Price, Totals>,
     touched: Vec<(Side, Price)>,
     seq: u64,
+    phase: Phase,
 }
 
 impl Publisher {
@@ -150,6 +182,8 @@ impl Publisher {
                     if let Some((side, price, open)) = self.resting.remove(&id) {
                         assert_eq!(open, remaining, "order {id}: canceled quantity");
                         self.reduce(side, price, open, 1);
+                    } else if let Some((_, open)) = self.market.remove(&id) {
+                        assert_eq!(open, remaining, "market order {id}: canceled quantity");
                     }
                 }
                 Event::Modified {
@@ -158,6 +192,12 @@ impl Publisher {
                     qty,
                     kept_priority,
                 } => {
+                    // A market order that gets a price leaves the market queue; its
+                    // `Booked` event follows.
+                    if self.market.remove(&id).is_some() {
+                        assert!(!kept_priority, "market order {id}: in-place modify");
+                        continue;
+                    }
                     let &(side, old_price, open) = self
                         .resting
                         .get(&id)
@@ -175,6 +215,40 @@ impl Publisher {
                         self.reduce(side, old_price, open, 1);
                     }
                 }
+                Event::MarketBooked { id, side, qty } => {
+                    let previous = self.market.insert(id, (side, qty));
+                    assert!(previous.is_none(), "market order {id} booked twice");
+                }
+                Event::AuctionTrade {
+                    buy,
+                    sell,
+                    price,
+                    qty,
+                    buy_remaining,
+                    sell_remaining,
+                } => {
+                    self.auction_fill(buy, Side::Buy, price, qty, buy_remaining);
+                    self.auction_fill(sell, Side::Sell, price, qty, sell_remaining);
+                }
+                Event::Uncrossed {
+                    price,
+                    volume,
+                    imbalance_side,
+                    imbalance,
+                } => {
+                    self.seq += 1;
+                    out.push(Message::Auction {
+                        seq: self.seq,
+                        result: UncrossSummary {
+                            price,
+                            volume,
+                            imbalance_side,
+                            imbalance,
+                        },
+                    });
+                }
+                Event::CallStarted { reference } => self.status(Phase::Call, reference, out),
+                Event::Resumed => self.status(Phase::Continuous, None, out),
                 Event::Accepted { .. } | Event::Rejected { .. } => {}
             }
         }
@@ -204,6 +278,51 @@ impl Publisher {
         BookSnapshot {
             seq: self.seq,
             depth: depth_of(&self.bids, &self.asks, usize::MAX),
+            phase: self.phase,
+        }
+    }
+
+    fn status(&mut self, phase: Phase, reference: Option<Price>, out: &mut Vec<Message>) {
+        self.phase = phase;
+        self.seq += 1;
+        out.push(Message::Status {
+            seq: self.seq,
+            phase,
+            reference,
+        });
+    }
+
+    /// One order's side of an auction trade. A limit order trades at the clearing price,
+    /// which its limit must allow, and leaves its own level; a market order has no level.
+    fn auction_fill(&mut self, id: OrderId, side: Side, price: Price, qty: Qty, remaining: Qty) {
+        if let Some(&(order_side, limit, open)) = self.resting.get(&id) {
+            assert!(
+                order_side == side && crate::types::crosses(side.opposite(), Some(price), limit),
+                "auction trade at {price} against order {id}, which rests as {side} {limit}"
+            );
+            assert_eq!(open - qty, remaining, "order {id}: auction trade quantity");
+            if remaining == 0 {
+                self.resting.remove(&id);
+                self.reduce(side, limit, qty, 1);
+            } else {
+                self.resting.insert(id, (side, limit, remaining));
+                self.reduce(side, limit, qty, 0);
+            }
+            return;
+        }
+        let Some(&(order_side, open)) = self.market.get(&id) else {
+            panic!("auction trade for order {id}, which is not resting");
+        };
+        assert_eq!(order_side, side, "market order {id}: auction trade side");
+        assert_eq!(
+            open - qty,
+            remaining,
+            "market order {id}: auction trade quantity"
+        );
+        if remaining == 0 {
+            self.market.remove(&id);
+        } else {
+            self.market.insert(id, (side, remaining));
         }
     }
 
@@ -266,6 +385,8 @@ pub struct BookBuilder {
     next: u64,
     gap: Option<Gap>,
     last_trade: Option<(Price, Qty, Side)>,
+    last_auction: Option<UncrossSummary>,
+    phase: Phase,
 }
 
 impl Default for BookBuilder {
@@ -284,6 +405,8 @@ impl BookBuilder {
             next: 1,
             gap: None,
             last_trade: None,
+            last_auction: None,
+            phase: Phase::Continuous,
         }
     }
 
@@ -311,6 +434,8 @@ impl BookBuilder {
             next: snapshot.seq + 1,
             gap: None,
             last_trade: None,
+            last_auction: None,
+            phase: snapshot.phase,
         }
     }
 
@@ -355,6 +480,8 @@ impl BookBuilder {
                     book.insert(price, Totals { qty, orders });
                 }
             }
+            Message::Status { phase, .. } => self.phase = phase,
+            Message::Auction { result, .. } => self.last_auction = Some(result),
         }
         self.next += 1;
         Ok(())
@@ -377,9 +504,10 @@ impl BookBuilder {
 
     /// Replaces the book with `snapshot` and clears a detected gap.
     pub fn resync(&mut self, snapshot: &BookSnapshot) {
-        let last_trade = self.last_trade;
+        let (last_trade, last_auction) = (self.last_trade, self.last_auction);
         *self = Self::from_snapshot(snapshot);
         self.last_trade = last_trade;
+        self.last_auction = last_auction;
     }
 
     /// `false` after a detected gap, until [`Self::resync`].
@@ -394,10 +522,22 @@ impl BookBuilder {
         self.next
     }
 
-    /// The most recent trade: price, quantity and aggressor side.
+    /// The most recent continuous trade: price, quantity and aggressor side.
     #[must_use]
     pub const fn last_trade(&self) -> Option<(Price, Qty, Side)> {
         self.last_trade
+    }
+
+    /// The result of the most recent uncross.
+    #[must_use]
+    pub const fn last_auction(&self) -> Option<UncrossSummary> {
+        self.last_auction
+    }
+
+    /// The trading phase, as the feed last announced it.
+    #[must_use]
+    pub const fn phase(&self) -> Phase {
+        self.phase
     }
 
     /// Up to `levels` price levels per side, best first, as [`crate::Engine::depth`] reports them.

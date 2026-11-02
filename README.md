@@ -1,8 +1,9 @@
 # crossbook
 
 A limit order book and matching engine in Rust: price-time priority, the order types
-real venues use, and a deterministic event stream, checked against a second
-implementation and compiled to WebAssembly so it runs in your browser.
+real venues use, opening and closing call auctions, and a deterministic event stream,
+checked against a second implementation and compiled to WebAssembly so it runs in your
+browser.
 
 [![CI](https://github.com/ult666666/crossbook/actions/workflows/ci.yml/badge.svg)](https://github.com/ult666666/crossbook/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -22,13 +23,20 @@ the design, the testing and the results.
 - **Order types.** Limit and market; good-till-canceled, immediate-or-cancel and
   fill-or-kill; post-only; cancel; modify with explicit queue-priority rules; four
   self-trade prevention modes.
+- **Call auctions.** A call phase collects orders without matching, as exchanges do
+  before the open, before the close and after a halt. The uncross picks one clearing
+  price by the rules Xetra and Euronext publish (most volume, then smallest surplus, then
+  market pressure, then the reference price) and fills every crossing order at it in
+  price-time priority. During the call, an indicative uncross reports the price, volume and
+  surplus an uncross would produce.
 - **Events, not state.** Each command emits a precise, ordered list of events: accepted,
-  trade, booked, canceled, rejected, modified. The full contract is in
-  [docs/SEMANTICS.md](docs/SEMANTICS.md).
+  trade, booked, canceled, rejected, modified, and for auctions call started, auction
+  trade and uncrossed. The full contract is in [docs/SEMANTICS.md](docs/SEMANTICS.md).
 - **Deterministic.** The same commands produce the same events on x86-64 Linux, ARM64
   macOS, Windows and WebAssembly. CI checks all four.
 - **Crash recovery.** Checksummed snapshots plus a write-ahead journal rebuild the book
-  exactly after a crash, and a half-written final command is detected and ignored.
+  exactly after a crash, also in the middle of a call phase, and a half-written final
+  command is detected and ignored. Files from earlier versions still load.
 - **Market data.** Trade prints and price-level updates are derived from the event
   stream alone, with sequence numbers, gap detection and resynchronization for
   subscribers.
@@ -43,13 +51,15 @@ the design, the testing and the results.
 | Throughput, one core, synthetic flow | 15 to 16 million commands per second |
 | Latency per command, p50 / p99 / p99.9 | 64 ns / 196 ns / 477 ns |
 | Same session compiled to WebAssembly (Node.js) | about 8.3 million commands per second, with the same event digest and state hash as the native build |
-| Differential tests against the reference model | 1,024 random command streams per local run, 4,096 in CI, plus a one-million-command check |
-| Mutation testing (cargo-mutants) | Engine: 140 of 148 compiling mutants caught; of the 8 survivors, 4 are now covered by new assertions, 2 pointed at redundant code that was deleted, and 2 only drop a capacity hint. Recovery, market data and sharding: 165 of 175 caught after closing 14 gaps; the 10 survivors only change buffer recycling or comparisons where equality is already ruled out |
+| Differential tests against the reference model | 1,024 random command streams per local run, 4,096 in CI, plus one-million-command checks with and without auctions |
+| Auction price against brute force | Agrees on 20,000 seeded books where every rule decides at least 126 times, plus 1,024 random books per run; every uncross passes seven allocation invariants |
+| Uncross on a closing call book of 8,452 orders | About 54 µs for 1,608 fills; the indicative uncross takes about 0.34 µs |
+| Mutation testing (cargo-mutants) | Engine: 140 of 148 compiling mutants caught; of the 8 survivors, 4 are now covered by new assertions, 2 pointed at redundant code that was deleted, and 2 only drop a capacity hint. Recovery, market data and sharding: 165 of 175 caught after closing 14 gaps; the 10 survivors only change buffer recycling or comparisons where equality is already ruled out. Auction code: 310 of 323 caught (3 by timeout); 5 survivors led to fixes, and the 8 left cannot change behavior |
 | Crash recovery, one million commands | A snapshot at 400,000 commands plus the journal tail reaches the full replay's state hash; loading it and replaying 600,000 commands takes about 0.15 s |
 | Market data, one million commands | The book rebuilt from the feed alone equals the engine's; 1.16 messages per command |
 | 64 instruments on a 4-core VM | 2.6 to 3.4 times the single-thread rate with 3 or 4 shards, with identical output for every shard count |
 
-Single-book figures: a 2.1 GHz Intel Xeon cloud VM, one pinned core, Rust 1.97 (medians of three seeds, 5 million commands each). Multi-instrument figures: a 2.8 GHz 4-vCPU cloud VM. The commands are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+Single-book figures: a 2.1 GHz Intel Xeon cloud VM, one pinned core, Rust 1.97 (medians of three seeds, 5 million commands each). Multi-instrument figures: a 2.8 GHz 4-vCPU cloud VM. Auction figures: Criterion estimates on the same kind of 2.1 GHz VM with Rust 1.99, while other jobs shared the machine. The commands are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 The matching core only: no network, parsing or persistence on the timed path.
 
 ## Quick start
@@ -60,6 +70,7 @@ Needs Rust 1.88 or newer.
 git clone https://github.com/ult666666/crossbook
 cd crossbook
 cargo run --release -p crossbook-cli -- demo
+cargo run --release -p crossbook-cli -- auction
 ```
 
 The demo walks through a short session:
@@ -74,12 +85,31 @@ The demo walks through a short session:
   rejected #5: fill-or-kill order cannot fill in full
 ```
 
+The auction demo prints the indicative uncross after each order of an opening call, then
+the uncross itself:
+
+```text
+# 8 lots can trade at 100 or 101, both with 2 lots left to sell: with sellers in excess, the lower price
+  accepted #4 buy 3 @ 101
+  booked #4 buy 3 @ 101
+  indicative uncross: 8 lots @ 100, surplus 2 sell
+
+# The uncross: every crossing order trades at 101, market orders first, then better prices, then earlier orders
+  auction trade 2 @ 101 (buy #5, sell #1)
+  auction trade 4 @ 101 (buy #3, sell #1)
+  auction trade 1 @ 101 (buy #3, sell #2)
+  auction trade 3 @ 101 (buy #4, sell #2)
+  auction trade 3 @ 101 (buy #8, sell #6)
+  uncrossed at 101: 13 lots, surplus 1 buy
+```
+
 Other commands:
 
 ```bash
 cargo run --release -p crossbook-cli -- bench --orders 5000000    # throughput and latency
 cargo run --release -p crossbook-cli -- verify --orders 1000000   # fast engine vs reference model
 cargo run --release -p crossbook-cli -- gen --out flow.xbk        # write a binary command journal
+cargo run --release -p crossbook-cli -- gen --auctions --out day.xbk  # trading days with opening and closing auctions
 cargo run --release -p crossbook-cli -- replay flow.xbk           # replay it and print fingerprints
 cargo run --release -p crossbook-cli -- snapshot flow.xbk --at 400000 --out flow.xbs
 cargo run --release -p crossbook-cli -- recover flow.xbk --snapshot flow.xbs   # rebuild after a crash
@@ -109,6 +139,26 @@ for event in &events {
 }
 ```
 
+An auction: start a call phase, let orders cross without trading, read the indicative
+uncross, then uncross and resume continuous trading.
+
+```rust
+use crossbook::{Command, Engine, NewOrder, Side, UncrossSummary};
+
+let mut engine = Engine::new();
+let mut events = Vec::new();
+engine.process(&Command::StartCall { reference: Some(100) }, &mut events);
+engine.process(&Command::New(NewOrder::limit(1, Side::Buy, 101, 8)), &mut events);
+engine.process(&Command::New(NewOrder::limit(2, Side::Sell, 100, 5)), &mut events);
+
+// 5 lots can trade at 100 or 101, with 3 left to buy at both: buyers press, so 101.
+let summary = UncrossSummary { price: Some(101), volume: 5, imbalance_side: Some(Side::Buy), imbalance: 3 };
+assert_eq!(engine.indicative_uncross(), summary);
+engine.process(&Command::Uncross, &mut events);
+engine.process(&Command::Resume, &mut events);
+assert_eq!(engine.order(1).map(|order| order.remaining), Some(3));
+```
+
 ## How it is checked
 
 - **Scenario tests** pin every rule in the spec to exact events.
@@ -126,6 +176,11 @@ for event in &events {
   equal the engine's, and a lost message must be detected and repaired.
 - **Shard independence.** Random multi-instrument streams must produce exactly the
   single-thread output for any shard count, batch size and queue length.
+- **Auctions.** A brute-force uncross that tries every candidate price must agree with the
+  engine on books built to tie at every rule, and every uncross must fill no order beyond
+  its limit, conserve volume, respect priority and leave the book uncrossed. The
+  differential, crash-recovery, market-data and shard tests all run sessions with
+  auctions.
 
 Details: [docs/TESTING.md](docs/TESTING.md).
 
@@ -137,18 +192,21 @@ Each level is a FIFO queue threaded through a single slab of 48-byte order nodes
 and go. The engine never reads a clock or a random number generator and never iterates a
 hash map, which is what makes it deterministic. That determinism carries the rest:
 recovery replays a journal from a snapshot, the market-data feed is a function of the
-events, and the sharded runner restores one global order with sequence numbers. Design
-notes, costs and the alternatives considered: [docs/DESIGN.md](docs/DESIGN.md).
+events, and the sharded runner restores one global order with sequence numbers. A call
+phase keeps the same structures (levels may cross, and market orders wait in one queue per
+side); the uncross finds the clearing price in one pass over the cached level totals.
+Design notes, costs, the auction rules with their sources, and the alternatives
+considered: [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Project layout
 
 | Path | Contents |
 | --- | --- |
-| `crates/crossbook` | The engine, the reference model, codec, journal, snapshots and recovery, market data, the sharded runner, synthetic flow, tests and benchmarks |
-| `crates/crossbook-cli` | The `crossbook` command: `demo`, `bench`, `verify`, `gen`, `replay`, `snapshot`, `recover`, `feed`, `exchange` |
+| `crates/crossbook` | The engine and call auctions, the reference model, codec, journal, snapshots and recovery, market data, the sharded runner, synthetic flow, tests and benchmarks |
+| `crates/crossbook-cli` | The `crossbook` command: `demo`, `auction`, `bench`, `verify`, `gen`, `replay`, `snapshot`, `recover`, `feed`, `exchange` |
 | `crates/crossbook-wasm` | WebAssembly bindings used by the playground |
 | `web/` | The browser playground (static HTML, CSS and JavaScript) |
-| `docs/` | Semantics, design, testing and benchmark notes |
+| `docs/` | Semantics, design, testing and benchmark notes; release notes are in [CHANGELOG.md](CHANGELOG.md) |
 
 ## Scope
 

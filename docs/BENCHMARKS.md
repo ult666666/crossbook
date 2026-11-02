@@ -71,6 +71,35 @@ The reference model is the linear-scan implementation used for differential test
 Even on a 500-order book it is about ten times slower; on the 10,000-order book above it
 would be far slower, which is why the CLI's `verify` command defaults to a smaller book.
 
+## Call auctions
+
+```bash
+cargo bench -p crossbook --bench engine -- auctions
+```
+
+Both benchmarks start from the closing call of the first synthetic trading day (seed 42,
+`--auctions` schedule), just before its uncross: 8,452 resting orders on 29 bid and 37 ask
+levels, crossed over several ticks, with market orders waiting. That uncross executes
+1,608 fills for 15,313 lots (counted with `crossbook gen --auctions --orders 100004` and
+`--orders 100005`, then `crossbook replay`).
+
+| Benchmark | Time (Criterion estimate and 95% interval) |
+| --- | --- |
+| Indicative uncross on the closing call book | 337 ns (324 to 352 ns) |
+| Uncross of the closing call book, 1,608 fills | 54.1 µs (52.7 to 56.0 µs), about 34 ns per fill |
+
+The indicative uncross reads only cached level totals in one pass, so its cost grows with
+the number of price levels (66 here), not with the number of orders. The uncross clones the
+book outside the timed region for every iteration, so it includes cold-cache effects.
+
+These ran on a 2.1 GHz Intel Xeon cloud VM (4 vCPUs, Linux 6.18, Rust 1.99.1) pinned to one
+core, while other jobs kept the machine's load average near 4, so treat them as upper
+bounds. On the same machine and under the same load, `crossbook bench --orders 5000000`
+for seeds 42, 1 and 2, run twice and alternating between the 0.2 and 0.3 binaries, gave
+12.2 to 16.0 million commands per second for 0.2 and 12.4 to 17.5 million for 0.3, with
+identical state hashes: adding the phase check to the continuous path made no difference
+that this noise could show. The single-book table above comes from an idle machine.
+
 ## WebAssembly
 
 The same engine compiled to `wasm32-unknown-unknown` and run under Node.js 22 on the

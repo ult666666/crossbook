@@ -13,6 +13,9 @@ random command streams.
   events to the caller's buffer. The order of those events is part of the contract.
 - Nothing depends on wall-clock time. Time priority is the order in which orders were
   booked.
+- The book is in one of two trading phases: continuous trading, where incoming orders
+  match on arrival (everything up to [Trading phases](#trading-phases-and-call-auctions)
+  describes it), or an auction call phase, where orders rest until an uncross.
 
 ## Commands
 
@@ -21,6 +24,9 @@ random command streams.
 | `New` | `id`, `account`, `side`, `kind` (`Limit(price)` or `Market`), `qty`, `tif` (`Gtc`, `Ioc`, `Fok`), `post_only`, `stp` |
 | `Cancel` | `id` |
 | `Modify` | `id`, new `price`, new remaining `qty` |
+| `StartCall` | optional `reference` price |
+| `Uncross` | none |
+| `Resume` | none |
 
 ## New orders
 
@@ -33,11 +39,15 @@ book does not change.
 | --- | --- | --- |
 | 1 | `qty` is 0 or above `MAX_QTY` (4,294,967,295) | `InvalidQuantity` |
 | 2 | Limit price is 0 or negative | `InvalidPrice` |
-| 3 | Market order with `Gtc` | `MarketOrderCannotRest` |
-| 4 | Post-only on a market, IOC or FOK order | `PostOnlyRequiresGtcLimit` |
+| 3 | Market order with `Gtc` (continuous trading only) | `MarketOrderCannotRest` |
+| 4 | Post-only on a market, IOC or FOK order (continuous trading only) | `PostOnlyRequiresGtcLimit` |
 | 5 | `id` belongs to a live (resting) order | `DuplicateOrderId` |
 | 6 | Post-only order would trade on arrival | `PostOnlyWouldCross` |
 | 7 | FOK order cannot fill in full right now | `FillOrKillUnfillable` |
+
+In a call phase, checks 3 and 4 are replaced by one check: an IOC, FOK or post-only order
+is rejected with `NeedsContinuousTrading`. Checks 6 and 7 cannot fire there, since only
+GTC orders without post-only remain.
 
 Ids only need to be unique among live orders. Once an order has filled or been
 canceled, its id may be reused.
@@ -110,6 +120,76 @@ Validation, in order: unknown id (`UnknownOrder`), quantity 0 or above `MAX_QTY`
 A post-only order whose new price would cross the opposite side is rejected with
 `PostOnlyWouldCross` and stays exactly as it was.
 
+## Trading phases and call auctions
+
+Exchanges open and close the trading day with a call auction, and reopen with one after a
+halt. During the call, orders collect without matching; at the uncross, one clearing
+price is chosen and every crossing order executes at it.
+
+### Phase commands
+
+Phase commands come from the venue's schedule, not from participants, so they are never
+rejected: each one has a defined effect in both phases.
+
+| Command | Effect | Events |
+| --- | --- | --- |
+| `StartCall { reference }` | Enter the call phase, or stay in it. The auction's reference price becomes `reference` if it is given and positive, otherwise the price of the last trade (none if nothing has traded). Resting post-only orders are canceled. | `CallStarted { reference }`, then `Canceled { reason: CallPhase }` for each post-only order in book order |
+| `Uncross` | Run the auction described below. The book stays in the call phase. In continuous trading the book never crosses, so nothing executes. | `AuctionTrade` per fill, `Canceled { reason: Unfilled }` per waiting market order, then `Uncrossed` |
+| `Resume` | Return to continuous trading and clear the reference price. If the book is crossed or holds market orders, uncross first, so continuous trading never starts from a crossed book. | the uncross events if it ran, then `Resumed` |
+
+### Orders during a call phase
+
+| Order | During a call phase |
+| --- | --- |
+| GTC limit | `Accepted`, then `Booked` at its limit. It never trades on arrival, even when it crosses the book. |
+| Market | Must be GTC: it waits for the uncross (`Accepted`, then `MarketBooked`) ahead of every limit order on its side. What the uncross does not fill is canceled, because a market order never rests in continuous trading. |
+| IOC or FOK, limit or market | Rejected: `NeedsContinuousTrading`. Both need immediate matching, which a call does not offer. |
+| Post-only | Rejected: `NeedsContinuousTrading`. Every auction trade takes liquidity, so a post-only order cannot take part; resting ones are canceled when the call starts. |
+| Cancel | As in continuous trading, for limit and market orders. |
+| Modify | The same validation and priority rules, but a re-entered order rests instead of matching. A waiting market order has no price to keep, so a modify always turns it into a GTC limit order at the back of its level. |
+
+Self-trade prevention does not apply in a call phase: nothing matches on arrival, and
+the uncross ignores it. Canceling an order after the clearing price was chosen from its
+quantity would make the published price and volume wrong.
+
+### The clearing price
+
+For a price `p`, demand `D(p)` is the quantity of market buys plus bids with a limit at or
+above `p`; supply `S(p)` is the quantity of market sells plus asks with a limit at or below
+`p`. The executable volume at `p` is `min(D(p), S(p))`, and the surplus is
+`|D(p) - S(p)|`, on the buy side when demand is larger.
+
+The candidates are the distinct limit prices on the book. Each rule keeps only the
+candidates that tie under the rules before it:
+
+1. **Volume.** The highest executable volume. If it is 0, nothing executes: there is no
+   clearing price.
+2. **Surplus.** The lowest surplus.
+3. **Market pressure.** If every remaining candidate has a buy surplus, the highest price;
+   if every one has a sell surplus, the lowest.
+4. **Reference price.** The candidate closest to the auction's reference price.
+5. **Lowest price.** The lowest remaining candidate, which settles an exact tie under rule
+   4 and any tie when there is no reference price.
+
+A book with market orders on both sides and no limit orders has no candidate. It clears at
+the reference price, or does not trade without one. The rules, their sources and where
+they differ from Xetra and Euronext are in [DESIGN.md](DESIGN.md#call-auctions).
+
+### Execution
+
+At clearing price `P` with volume `V`, each side fills `V` lots in priority order: market
+orders first (oldest first), then limit orders from the best price to `P`, oldest first
+within a price. Orders with a limit worse than `P` are untouched. The side without a
+surplus fills completely; on the other side, the last order reached may fill partly and the
+surplus stays on the book. Fills are paired in that order: the first unfilled buy trades
+with the first unfilled sell, and each `AuctionTrade` reports both orders' open quantity
+afterwards. Then every waiting market order's remainder is canceled, buys before sells,
+oldest first, and `Uncrossed` reports the price, volume and surplus. Afterwards the best
+bid is below the best ask.
+
+`Engine::indicative_uncross` returns the same price, volume and surplus without executing,
+which is what exchanges publish during a call.
+
 ## Event reference
 
 | Event | Meaning |
@@ -118,12 +198,17 @@ A post-only order whose new price would cross the opposite side is rejected with
 | `Rejected { id, reason }` | A command failed validation and changed nothing |
 | `Trade { taker, maker, taker_side, price, qty, taker_remaining, maker_remaining }` | One fill at the maker's price |
 | `Booked { id, side, price, qty }` | The remainder now rests on the book |
-| `Canceled { id, remaining, reason }` | Open quantity left without trading: `Requested`, `Unfilled` or `SelfTrade` |
+| `Canceled { id, remaining, reason }` | Open quantity left without trading: `Requested`, `Unfilled`, `SelfTrade` or `CallPhase` |
 | `Modified { id, price, qty, kept_priority }` | A resting order changed |
+| `MarketBooked { id, side, qty }` | A market order waits for the uncross; it belongs to no price level |
+| `CallStarted { reference }` | The call phase started, with this reference price |
+| `AuctionTrade { buy, sell, price, qty, buy_remaining, sell_remaining }` | One fill of an uncross, at the clearing price |
+| `Uncrossed { price, volume, imbalance_side, imbalance }` | An uncross finished; `price` is `None` when nothing could execute |
+| `Resumed` | Continuous trading resumed |
 
 ## Not modeled
 
-Multiple instruments, opening and closing auctions, stop and iceberg orders,
-good-till-date expiry, minimum quantities, price bands and circuit breakers, tick
-sizes other than 1, fees, and a market-data feed. The engine keeps the book in memory;
-durability comes from journaling commands and replaying them.
+Stop and iceberg orders, good-till-date expiry, minimum quantities, price bands,
+volatility interruptions that start a call automatically, tick sizes other than 1, and
+fees. One book holds one instrument; `exchange` runs many books. The engine keeps the book
+in memory; durability comes from journaling commands and replaying them.

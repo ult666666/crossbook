@@ -20,6 +20,16 @@ pub type Qty = u64;
 /// order at `u32::MAX` lots makes overflow impossible.
 pub const MAX_QTY: Qty = u32::MAX as Qty;
 
+/// The trading phase of a book.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Phase {
+    /// Continuous trading: an incoming order matches on arrival.
+    #[default]
+    Continuous,
+    /// Auction call phase: orders collect without matching until an uncross.
+    Call,
+}
+
 /// Order side.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Side {
@@ -188,6 +198,21 @@ pub enum Command {
         /// New remaining quantity.
         qty: Qty,
     },
+    /// Start an auction call phase: orders collect without matching until an uncross.
+    ///
+    /// The auction's reference price is `reference` when it is given and positive,
+    /// otherwise the price of the last trade. Resting post-only orders are canceled. In a
+    /// call phase already, only the reference price changes.
+    StartCall {
+        /// Reference price for the uncross, such as the previous closing price.
+        reference: Option<Price>,
+    },
+    /// Run the auction: find one clearing price and execute every crossing order at it.
+    /// The book stays in the call phase.
+    Uncross,
+    /// Return to continuous trading. A book that is crossed or holds market orders is
+    /// uncrossed first.
+    Resume,
 }
 
 /// Why a command was rejected. A rejected command never changes the book.
@@ -209,6 +234,9 @@ pub enum RejectReason {
     PostOnlyWouldCross,
     /// A fill-or-kill order could not be filled in full.
     FillOrKillUnfillable,
+    /// An IOC, FOK or post-only order arrived during a call phase. Each needs immediate
+    /// matching, which only continuous trading offers.
+    NeedsContinuousTrading,
 }
 
 /// Why live quantity left the book or an order ended without resting.
@@ -216,10 +244,14 @@ pub enum RejectReason {
 pub enum CancelReason {
     /// The client asked for the cancel.
     Requested,
-    /// IOC or market remainder that found no more liquidity.
+    /// IOC or market remainder that found no more liquidity, including a market order's
+    /// remainder after an uncross.
     Unfilled,
     /// Self-trade prevention.
     SelfTrade,
+    /// A call phase started. Post-only orders cannot take part in an auction, where every
+    /// trade takes liquidity.
+    CallPhase,
 }
 
 /// An output of the engine. One command produces one or more events, in a fixed order.
@@ -291,6 +323,81 @@ pub enum Event {
         /// `true` when the order kept its place in the queue.
         kept_priority: bool,
     },
+    /// A market order entered during a call phase now waits for the uncross. It has no
+    /// price, so it belongs to no price level.
+    MarketBooked {
+        /// Order id.
+        id: OrderId,
+        /// Order side.
+        side: Side,
+        /// Waiting quantity.
+        qty: Qty,
+    },
+    /// The book entered a call phase, or restarted one with a new reference price.
+    CallStarted {
+        /// The reference price the uncross will use, if any.
+        reference: Option<Price>,
+    },
+    /// One fill of an uncross. Both orders execute at the clearing price.
+    AuctionTrade {
+        /// Buy order.
+        buy: OrderId,
+        /// Sell order.
+        sell: OrderId,
+        /// The clearing price.
+        price: Price,
+        /// Executed quantity.
+        qty: Qty,
+        /// Buy order quantity still open after this trade.
+        buy_remaining: Qty,
+        /// Sell order quantity still open after this trade.
+        sell_remaining: Qty,
+    },
+    /// An uncross finished. The fields repeat its [`UncrossSummary`].
+    Uncrossed {
+        /// Clearing price, or `None` when nothing could execute.
+        price: Option<Price>,
+        /// Lots executed.
+        volume: Qty,
+        /// The side with unexecuted quantity at the clearing price, if any.
+        imbalance_side: Option<Side>,
+        /// Lots on that side that were willing to trade at the clearing price but did not.
+        imbalance: Qty,
+    },
+    /// The call phase ended and continuous trading resumed.
+    Resumed,
+}
+
+/// The result of auction price determination: what an uncross executes.
+///
+/// [`crate::Engine::indicative_uncross`] reports it during a call phase, as exchanges
+/// publish an indicative price, volume and surplus, and [`Event::Uncrossed`] repeats it
+/// when the uncross runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct UncrossSummary {
+    /// Clearing price, or `None` when no order can execute.
+    pub price: Option<Price>,
+    /// Lots that execute at the clearing price.
+    pub volume: Qty,
+    /// The side with more quantity willing to trade at the price: `None` when both sides
+    /// are equal or nothing executes.
+    pub imbalance_side: Option<Side>,
+    /// The surplus: lots on `imbalance_side` that are willing to trade at the price but do
+    /// not execute.
+    pub imbalance: Qty,
+}
+
+impl UncrossSummary {
+    /// The [`Event::Uncrossed`] that reports this result.
+    #[must_use]
+    pub const fn event(self) -> Event {
+        Event::Uncrossed {
+            price: self.price,
+            volume: self.volume,
+            imbalance_side: self.imbalance_side,
+            imbalance: self.imbalance,
+        }
+    }
 }
 
 /// Aggregated quantity at one price.
@@ -322,7 +429,8 @@ pub struct OrderView {
     pub account: AccountId,
     /// Side.
     pub side: Side,
-    /// Resting price.
+    /// Resting price, or 0 for a market order waiting for an uncross. Limit prices are
+    /// always positive, so 0 is never a limit.
     pub price: Price,
     /// Open quantity.
     pub remaining: Qty,
@@ -330,6 +438,26 @@ pub struct OrderView {
     pub stp: StpMode,
     /// Post-only flag used if the order is modified.
     pub post_only: bool,
+}
+
+impl OrderView {
+    /// True for a market order waiting in a call phase (its price is 0).
+    #[must_use]
+    pub const fn is_market(&self) -> bool {
+        self.price == MARKET
+    }
+}
+
+/// The price a market order rests at during a call phase. It is not a valid limit price.
+pub(crate) const MARKET: Price = 0;
+
+impl fmt::Display for Phase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Continuous => "continuous trading",
+            Self::Call => "call phase",
+        })
+    }
 }
 
 impl fmt::Display for Side {
@@ -352,6 +480,7 @@ impl fmt::Display for RejectReason {
             Self::UnknownOrder => "unknown order",
             Self::PostOnlyWouldCross => "post-only order would cross",
             Self::FillOrKillUnfillable => "fill-or-kill order cannot fill in full",
+            Self::NeedsContinuousTrading => "IOC, FOK and post-only orders need continuous trading",
         })
     }
 }
@@ -362,6 +491,7 @@ impl fmt::Display for CancelReason {
             Self::Requested => "requested",
             Self::Unfilled => "unfilled",
             Self::SelfTrade => "self-trade prevention",
+            Self::CallPhase => "post-only order removed by the call phase",
         })
     }
 }
@@ -417,7 +547,56 @@ impl fmt::Display for Event {
                 let priority = if kept_priority { "kept" } else { "lost" };
                 write!(f, "modified #{id} to {qty} @ {price} (priority {priority})")
             }
+            Self::MarketBooked { id, side, qty } => {
+                write!(f, "booked #{id} {side} {qty} @ market for the uncross")
+            }
+            Self::CallStarted {
+                reference: Some(reference),
+            } => write!(f, "call phase started (reference price {reference})"),
+            Self::CallStarted { reference: None } => {
+                f.write_str("call phase started (no reference price)")
+            }
+            Self::AuctionTrade {
+                buy,
+                sell,
+                price,
+                qty,
+                ..
+            } => write!(
+                f,
+                "auction trade {qty} @ {price} (buy #{buy}, sell #{sell})"
+            ),
+            Self::Uncrossed { price: None, .. } => f.write_str("uncrossed: nothing could execute"),
+            Self::Uncrossed {
+                price: Some(price),
+                volume,
+                imbalance,
+                imbalance_side,
+            } => {
+                write!(f, "uncrossed at {price}: {volume} lots")?;
+                write_surplus(f, imbalance, imbalance_side)
+            }
+            Self::Resumed => f.write_str("continuous trading resumed"),
         }
+    }
+}
+
+impl fmt::Display for UncrossSummary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.price {
+            Some(price) => {
+                write!(f, "{} lots @ {price}", self.volume)?;
+                write_surplus(f, self.imbalance, self.imbalance_side)
+            }
+            None => f.write_str("no price, nothing crosses"),
+        }
+    }
+}
+
+fn write_surplus(f: &mut fmt::Formatter<'_>, imbalance: Qty, side: Option<Side>) -> fmt::Result {
+    match side {
+        Some(side) => write!(f, ", surplus {imbalance} {side}"),
+        None => f.write_str(", no surplus"),
     }
 }
 
@@ -431,22 +610,30 @@ pub(crate) const fn crosses(side: Side, limit: Option<Price>, resting_price: Pri
     }
 }
 
-/// First syntactic check that `order` fails, independent of book state.
-pub(crate) const fn static_reject(order: &NewOrder) -> Option<RejectReason> {
+/// First check that `order` fails without looking at the book, given the trading phase.
+pub(crate) const fn static_reject(order: &NewOrder, phase: Phase) -> Option<RejectReason> {
     if order.qty == 0 || order.qty > MAX_QTY {
         return Some(RejectReason::InvalidQuantity);
     }
-    match order.kind {
-        OrderKind::Limit(price) if price <= 0 => return Some(RejectReason::InvalidPrice),
-        OrderKind::Market if matches!(order.tif, TimeInForce::Gtc) => {
-            return Some(RejectReason::MarketOrderCannotRest);
-        }
-        _ => {}
-    }
-    if order.post_only
-        && (matches!(order.kind, OrderKind::Market) || !matches!(order.tif, TimeInForce::Gtc))
+    if let OrderKind::Limit(price) = order.kind
+        && price <= 0
     {
-        return Some(RejectReason::PostOnlyRequiresGtcLimit);
+        return Some(RejectReason::InvalidPrice);
     }
-    None
+    let gtc = matches!(order.tif, TimeInForce::Gtc);
+    match phase {
+        // A call phase has no immediate matching, so only plain GTC orders join it. A GTC
+        // market order waits for the uncross.
+        Phase::Call if order.post_only || !gtc => Some(RejectReason::NeedsContinuousTrading),
+        Phase::Call => None,
+        Phase::Continuous if gtc && matches!(order.kind, OrderKind::Market) => {
+            Some(RejectReason::MarketOrderCannotRest)
+        }
+        Phase::Continuous
+            if order.post_only && (matches!(order.kind, OrderKind::Market) || !gtc) =>
+        {
+            Some(RejectReason::PostOnlyRequiresGtcLimit)
+        }
+        Phase::Continuous => None,
+    }
 }

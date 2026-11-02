@@ -6,7 +6,8 @@
 
 use crossbook::reference::ReferenceEngine;
 use crossbook::{
-    CancelReason, Command, Engine, Event, NewOrder, RejectReason, Side, StpMode, TimeInForce,
+    CancelReason, Command, Engine, Event, NewOrder, Phase, RejectReason, Side, StpMode,
+    TimeInForce, UncrossSummary,
 };
 
 use Side::{Buy, Sell};
@@ -32,7 +33,20 @@ impl Books {
         assert_eq!(fast, reference, "engines disagree on {command:?}");
         self.fast.check_invariants().unwrap();
         assert_eq!(self.fast.snapshot(), self.reference.snapshot());
+        assert_eq!(self.fast.phase(), self.reference.phase());
+        assert_eq!(
+            self.fast.indicative_uncross(),
+            self.reference.indicative_uncross()
+        );
         fast
+    }
+
+    fn start_call(&mut self, reference: Option<i64>) -> Vec<Event> {
+        self.run(Command::StartCall { reference })
+    }
+
+    fn market(&mut self, id: u64, side: Side, qty: u64) -> Vec<Event> {
+        self.new_order(NewOrder::market(id, side, qty).tif(TimeInForce::Gtc))
     }
 
     fn new_order(&mut self, order: NewOrder) -> Vec<Event> {
@@ -622,4 +636,462 @@ fn slots_are_reused_after_orders_leave() {
     }
     assert!(books.fast.is_empty());
     assert_eq!(books.fast.state_hash(), Engine::new().state_hash());
+}
+
+// ---------------------------------------------------------------------------------------
+// Call auctions
+
+fn uncrossed(price: i64, volume: u64, side: Option<Side>, imbalance: u64) -> Event {
+    Event::Uncrossed {
+        price: Some(price),
+        volume,
+        imbalance_side: side,
+        imbalance,
+    }
+}
+
+fn auction_trade(
+    buy: u64,
+    sell: u64,
+    price: i64,
+    qty: u64,
+    buy_left: u64,
+    sell_left: u64,
+) -> Event {
+    Event::AuctionTrade {
+        buy,
+        sell,
+        price,
+        qty,
+        buy_remaining: buy_left,
+        sell_remaining: sell_left,
+    }
+}
+
+const NOTHING: Event = Event::Uncrossed {
+    price: None,
+    volume: 0,
+    imbalance_side: None,
+    imbalance: 0,
+};
+
+#[test]
+fn a_call_phase_collects_orders_without_matching() {
+    let mut books = Books::new();
+    books.limit(1, Sell, 101, 5);
+    assert_eq!(
+        books.start_call(Some(100)),
+        [Event::CallStarted {
+            reference: Some(100)
+        }]
+    );
+    assert_eq!(books.fast.phase(), Phase::Call);
+    // A buy through the ask rests instead of trading, and the book crosses.
+    assert_eq!(
+        books.limit(2, Buy, 102, 3),
+        [accepted(2, Buy, Some(102), 3), booked(2, Buy, 102, 3)]
+    );
+    assert_eq!(books.fast.spread(), Some(-1));
+    // A GTC market order waits for the uncross, outside every price level.
+    assert_eq!(
+        books.market(3, Buy, 4),
+        [
+            accepted(3, Buy, None, 4),
+            Event::MarketBooked {
+                id: 3,
+                side: Buy,
+                qty: 4
+            }
+        ]
+    );
+    assert_eq!(books.fast.market_orders(Buy)[0].id, 3);
+    assert!(books.fast.order(3).is_some_and(|order| order.is_market()));
+    assert_eq!(books.fast.depth(5).bids.len(), 1);
+    // 5 lots can trade at 101 or 102, each leaving 2 to buy: buyers in excess, so 102.
+    assert_eq!(
+        books.fast.indicative_uncross(),
+        UncrossSummary {
+            price: Some(102),
+            volume: 5,
+            imbalance_side: Some(Buy),
+            imbalance: 2,
+        }
+    );
+    // The market order fills first. The sell at 101 gets the clearing price, 102.
+    assert_eq!(
+        books.run(Command::Uncross),
+        [
+            auction_trade(3, 1, 102, 4, 0, 1),
+            auction_trade(2, 1, 102, 1, 2, 0),
+            uncrossed(102, 5, Some(Buy), 2),
+        ]
+    );
+    assert_eq!(
+        books.fast.phase(),
+        Phase::Call,
+        "an uncross keeps the call phase"
+    );
+    assert_eq!(books.fast.last_trade_price(), Some(102));
+    assert_eq!(books.run(Command::Resume), [Event::Resumed]);
+    assert_eq!(books.fast.order(2).map(|order| order.remaining), Some(2));
+    assert_eq!(books.fast.reference_price(), None);
+}
+
+#[test]
+fn immediate_and_post_only_orders_need_continuous_trading() {
+    let mut books = Books::new();
+    books.new_order(NewOrder::limit(1, Buy, 99, 5).post_only());
+    books.limit(2, Sell, 101, 5);
+    // Auction trades take liquidity, so resting post-only orders leave when the call starts.
+    assert_eq!(
+        books.start_call(None),
+        [
+            Event::CallStarted { reference: None },
+            canceled(1, 5, CancelReason::CallPhase)
+        ]
+    );
+    let needs = |id| [rejected(id, RejectReason::NeedsContinuousTrading)];
+    for order in [
+        NewOrder::limit(3, Buy, 101, 1).tif(TimeInForce::Ioc),
+        NewOrder::limit(3, Buy, 101, 1).tif(TimeInForce::Fok),
+        NewOrder::market(3, Buy, 1),
+        NewOrder::market(3, Buy, 1).tif(TimeInForce::Fok),
+        NewOrder::limit(3, Buy, 99, 1).post_only(),
+    ] {
+        assert_eq!(books.new_order(order), needs(3), "{order:?}");
+    }
+    // Quantity and price are still checked first, and ids must still be unique.
+    let ioc = |price, qty| NewOrder::limit(4, Buy, price, qty).tif(TimeInForce::Ioc);
+    assert_eq!(
+        books.new_order(ioc(0, 5)),
+        [rejected(4, RejectReason::InvalidPrice)]
+    );
+    assert_eq!(
+        books.new_order(ioc(100, 0)),
+        [rejected(4, RejectReason::InvalidQuantity)]
+    );
+    assert_eq!(
+        books.limit(2, Buy, 100, 1),
+        [rejected(2, RejectReason::DuplicateOrderId)]
+    );
+    // Back in continuous trading, a GTC market order cannot rest again.
+    books.run(Command::Resume);
+    assert_eq!(
+        books.new_order(NewOrder::market(5, Buy, 1).tif(TimeInForce::Gtc)),
+        [rejected(5, RejectReason::MarketOrderCannotRest)]
+    );
+}
+
+#[test]
+fn rule_1_the_highest_executable_volume() {
+    let mut books = Books::new();
+    books.start_call(None);
+    for (id, side, price) in [
+        (1, Buy, 100),
+        (2, Buy, 101),
+        (3, Buy, 102),
+        (4, Sell, 100),
+        (5, Sell, 101),
+    ] {
+        books.limit(id, side, price, 4);
+    }
+    // 8 lots trade at 101, 4 at 100 or 102. The bid at 100 is worse than 101 and stays.
+    assert_eq!(
+        books.run(Command::Uncross),
+        [
+            auction_trade(3, 4, 101, 4, 0, 0),
+            auction_trade(2, 5, 101, 4, 0, 0),
+            uncrossed(101, 8, None, 0),
+        ]
+    );
+    assert_eq!(books.fast.order(1).map(|order| order.remaining), Some(4));
+}
+
+#[test]
+fn rule_2_the_lowest_surplus() {
+    let mut books = Books::new();
+    books.start_call(None);
+    books.limit(1, Buy, 100, 3);
+    books.limit(2, Buy, 102, 5);
+    books.limit(3, Sell, 100, 5);
+    books.limit(4, Sell, 102, 4);
+    // 5 lots at 100 leave 3 to buy; 5 at 102 leave 4 to sell.
+    let events = books.run(Command::Uncross);
+    assert_eq!(events.last(), Some(&uncrossed(100, 5, Some(Buy), 3)));
+}
+
+#[test]
+fn rule_3_market_pressure() {
+    // A buy surplus at both 100 and 101: the higher price, though the reference is lower.
+    let mut books = Books::new();
+    books.start_call(Some(50));
+    books.limit(1, Buy, 101, 8);
+    books.limit(2, Sell, 100, 5);
+    assert_eq!(
+        books.run(Command::Uncross),
+        [
+            auction_trade(1, 2, 101, 5, 3, 0),
+            uncrossed(101, 5, Some(Buy), 3)
+        ]
+    );
+    // A sell surplus: the lower price, though the reference is higher.
+    let mut books = Books::new();
+    books.start_call(Some(500));
+    books.limit(1, Buy, 101, 5);
+    books.limit(2, Sell, 100, 8);
+    assert_eq!(
+        books.run(Command::Uncross),
+        [
+            auction_trade(1, 2, 100, 5, 0, 3),
+            uncrossed(100, 5, Some(Sell), 3)
+        ]
+    );
+}
+
+#[test]
+fn rule_4_the_reference_price() {
+    // No surplus at 100 or 101: the price nearer the reference.
+    for (reference, price) in [(90, 100), (101, 101), (200, 101)] {
+        let mut books = Books::new();
+        books.start_call(Some(reference));
+        books.limit(1, Buy, 101, 5);
+        books.limit(2, Sell, 100, 5);
+        assert_eq!(
+            books.run(Command::Uncross).last(),
+            Some(&uncrossed(price, 5, None, 0)),
+            "reference {reference}"
+        );
+    }
+    // Without a reference given, the call uses the last trade, here 101.
+    let mut books = Books::new();
+    books.limit(1, Sell, 101, 1);
+    books.limit(2, Buy, 101, 1);
+    assert_eq!(
+        books.start_call(None),
+        [Event::CallStarted {
+            reference: Some(101)
+        }]
+    );
+    books.limit(3, Buy, 101, 5);
+    books.limit(4, Sell, 100, 5);
+    assert_eq!(
+        books.run(Command::Uncross).last(),
+        Some(&uncrossed(101, 5, None, 0))
+    );
+    // A reference of zero or below is ignored.
+    assert_eq!(
+        books.start_call(Some(0)),
+        [Event::CallStarted {
+            reference: Some(101)
+        }]
+    );
+}
+
+#[test]
+fn rule_5_the_lowest_price() {
+    // No reference price at all.
+    let mut books = Books::new();
+    books.start_call(None);
+    books.limit(1, Buy, 101, 5);
+    books.limit(2, Sell, 100, 5);
+    assert_eq!(
+        books.run(Command::Uncross).last(),
+        Some(&uncrossed(100, 5, None, 0))
+    );
+    // Mixed surplus sides with the reference exactly halfway.
+    let mut books = Books::new();
+    books.start_call(Some(101));
+    books.limit(1, Buy, 100, 3);
+    books.limit(2, Buy, 102, 5);
+    books.limit(3, Sell, 100, 5);
+    books.limit(4, Sell, 102, 3);
+    assert_eq!(
+        books.run(Command::Uncross).last(),
+        Some(&uncrossed(100, 5, Some(Buy), 3))
+    );
+}
+
+#[test]
+fn market_orders_alone_clear_at_the_reference_price() {
+    let mut books = Books::new();
+    books.start_call(Some(99));
+    books.market(1, Buy, 7);
+    books.market(2, Sell, 4);
+    assert_eq!(
+        books.run(Command::Uncross),
+        [
+            auction_trade(1, 2, 99, 4, 3, 0),
+            canceled(1, 3, CancelReason::Unfilled),
+            uncrossed(99, 4, Some(Buy), 3),
+        ]
+    );
+    assert!(books.fast.is_empty());
+    // Without a reference price nothing can trade, and the market orders are canceled.
+    let mut books = Books::new();
+    books.start_call(None);
+    books.market(1, Buy, 7);
+    books.market(2, Sell, 4);
+    assert_eq!(
+        books.run(Command::Uncross),
+        [
+            canceled(1, 7, CancelReason::Unfilled),
+            canceled(2, 4, CancelReason::Unfilled),
+            NOTHING,
+        ]
+    );
+}
+
+#[test]
+fn the_uncross_fills_in_price_time_priority() {
+    let mut books = Books::new();
+    books.start_call(None);
+    books.limit(1, Buy, 100, 3); // same price as #2 but earlier
+    books.limit(2, Buy, 100, 3);
+    books.limit(3, Buy, 101, 2); // better price
+    books.market(4, Buy, 1); // market orders come first
+    books.limit(5, Sell, 100, 5);
+    books.limit(6, Sell, 99, 2);
+    books.limit(7, Sell, 102, 9); // beyond the clearing price: untouched
+    let events = books.run(Command::Uncross);
+    assert_eq!(
+        events,
+        [
+            auction_trade(4, 6, 100, 1, 0, 1),
+            auction_trade(3, 6, 100, 1, 1, 0),
+            auction_trade(3, 5, 100, 1, 0, 4),
+            auction_trade(1, 5, 100, 3, 0, 1),
+            auction_trade(2, 5, 100, 1, 2, 0),
+            uncrossed(100, 7, Some(Buy), 2),
+        ]
+    );
+    assert_eq!(books.fast.order(2).map(|order| order.remaining), Some(2));
+    assert_eq!(books.fast.order(7).map(|order| order.remaining), Some(9));
+    assert_eq!(
+        books.fast.spread(),
+        Some(2),
+        "the uncrossed book: bid 100, ask 102"
+    );
+}
+
+#[test]
+fn self_trade_prevention_does_not_apply_at_the_uncross() {
+    let mut books = Books::new();
+    books.start_call(None);
+    books.new_order(
+        NewOrder::limit(1, Buy, 101, 5)
+            .account(7)
+            .stp(StpMode::CancelBoth),
+    );
+    books.new_order(
+        NewOrder::limit(2, Sell, 100, 5)
+            .account(7)
+            .stp(StpMode::CancelBoth),
+    );
+    assert_eq!(
+        books.run(Command::Uncross),
+        [
+            auction_trade(1, 2, 100, 5, 0, 0),
+            uncrossed(100, 5, None, 0)
+        ]
+    );
+}
+
+#[test]
+fn modifies_in_a_call_phase_never_trade() {
+    let mut books = Books::new();
+    books.limit(1, Sell, 101, 5);
+    books.limit(2, Buy, 99, 5);
+    books.start_call(None);
+    // Repricing through the ask re-enters the order without trading.
+    assert_eq!(
+        books.run(Command::Modify {
+            id: 2,
+            price: 102,
+            qty: 5
+        }),
+        [
+            Event::Modified {
+                id: 2,
+                price: 102,
+                qty: 5,
+                kept_priority: false
+            },
+            booked(2, Buy, 102, 5)
+        ]
+    );
+    // A market order has no price to keep, so a modify turns it into a limit order.
+    books.market(3, Buy, 4);
+    assert_eq!(
+        books.run(Command::Modify {
+            id: 3,
+            price: 100,
+            qty: 4
+        }),
+        [
+            Event::Modified {
+                id: 3,
+                price: 100,
+                qty: 4,
+                kept_priority: false
+            },
+            booked(3, Buy, 100, 4)
+        ]
+    );
+    assert!(books.fast.market_orders(Buy).is_empty());
+    assert_eq!(
+        books.run(Command::Cancel { id: 3 }),
+        [canceled(3, 4, CancelReason::Requested)]
+    );
+}
+
+#[test]
+fn resume_uncrosses_a_crossed_book_first() {
+    let mut books = Books::new();
+    books.start_call(Some(100));
+    books.limit(1, Buy, 101, 5);
+    books.limit(2, Sell, 100, 3);
+    books.market(3, Sell, 1);
+    // 4 lots at 100 or 101, each leaving 1 to buy: market pressure picks 101 before the
+    // reference price is consulted.
+    assert_eq!(
+        books.run(Command::Resume),
+        [
+            auction_trade(1, 3, 101, 1, 4, 0),
+            auction_trade(1, 2, 101, 3, 1, 0),
+            uncrossed(101, 4, Some(Buy), 1),
+            Event::Resumed,
+        ]
+    );
+    assert_eq!(books.fast.phase(), Phase::Continuous);
+    // A waiting market order alone is enough reason to uncross: it cannot rest.
+    books.start_call(None);
+    books.market(4, Buy, 2);
+    assert_eq!(
+        books.run(Command::Resume),
+        [
+            canceled(4, 2, CancelReason::Unfilled),
+            NOTHING,
+            Event::Resumed
+        ]
+    );
+}
+
+#[test]
+fn phase_commands_are_valid_in_continuous_trading() {
+    let mut books = Books::new();
+    books.limit(1, Buy, 99, 5);
+    books.limit(2, Sell, 101, 5);
+    // The book never crosses in continuous trading, so an uncross finds nothing to do.
+    assert_eq!(books.run(Command::Uncross), [NOTHING]);
+    assert_eq!(books.run(Command::Resume), [Event::Resumed]);
+    // Starting a call twice just replaces the reference price.
+    books.start_call(Some(100));
+    assert_eq!(
+        books.start_call(Some(98)),
+        [Event::CallStarted {
+            reference: Some(98)
+        }]
+    );
+    assert_eq!(books.fast.reference_price(), Some(98));
+    assert_eq!(books.fast.len(), 2);
 }

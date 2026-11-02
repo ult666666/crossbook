@@ -9,13 +9,19 @@
 //!   thinner, so book size stays stable over long runs;
 //! - a small share of aggressive limit, IOC, FOK and market orders cross the spread.
 //!
+//! With a [`Schedule`] the stream becomes a sequence of trading days: an opening call
+//! phase and uncross, continuous trading, and a closing call phase and uncross. During a
+//! call the generator sends GTC limit orders on both sides of fair value, so that they
+//! overlap and the uncross has something to execute, plus a few market orders.
+//!
 //! Only integer arithmetic and its own PRNG are used, so a seed yields the same stream on
 //! every platform, including WebAssembly. The flow is synthetic and not calibrated to any
 //! real market; it exists to exercise every code path at a realistic mix.
 
 use crate::Engine;
 use crate::types::{
-    AccountId, Command, Event, NewOrder, OrderId, OrderKind, Price, Qty, Side, StpMode, TimeInForce,
+    AccountId, Command, Event, NewOrder, OrderId, OrderKind, Phase, Price, Qty, Side, StpMode,
+    TimeInForce,
 };
 
 /// SplitMix64: a small, fast, well-tested 64-bit generator (Steele, Lea and Flood, 2014).
@@ -71,8 +77,11 @@ pub struct FlowConfig {
     pub ioc: u64,
     /// Marketable FOK limit orders.
     pub fok: u64,
-    /// IOC market orders.
+    /// IOC market orders (in a call phase, GTC market orders that wait for the uncross).
     pub market: u64,
+    /// Trading days with opening and closing auctions, or `None` for continuous trading
+    /// only.
+    pub session: Option<Schedule>,
 }
 
 impl Default for FlowConfig {
@@ -88,7 +97,40 @@ impl Default for FlowConfig {
             ioc: 25,
             fok: 5,
             market: 10,
+            session: None,
         }
+    }
+}
+
+/// One trading day: `StartCall`, the opening call's commands, `Uncross` and `Resume`, then
+/// continuous trading, then `StartCall`, the closing call's commands and `Uncross`. The
+/// first day's opening call uses the starting fair value as its reference price, as a
+/// venue would use the previous close; later days use the last trade.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Schedule {
+    /// Orders, cancels and modifies in each opening call phase.
+    pub opening_call: usize,
+    /// Commands of continuous trading each day.
+    pub continuous: usize,
+    /// Orders, cancels and modifies in each closing call phase.
+    pub closing_call: usize,
+}
+
+impl Default for Schedule {
+    fn default() -> Self {
+        Self {
+            opening_call: 5_000,
+            continuous: 90_000,
+            closing_call: 5_000,
+        }
+    }
+}
+
+impl Schedule {
+    /// Commands per day, including the five phase commands.
+    #[must_use]
+    pub const fn day_len(&self) -> usize {
+        self.opening_call + self.continuous + self.closing_call + 5
     }
 }
 
@@ -113,6 +155,7 @@ pub struct Flow {
     shadow: Engine,
     live: Vec<OrderId>,
     scratch: Vec<Event>,
+    step: usize,
 }
 
 impl Flow {
@@ -127,6 +170,7 @@ impl Flow {
             shadow: Engine::new(),
             live: Vec::new(),
             scratch: Vec::new(),
+            step: 0,
         }
     }
 
@@ -244,13 +288,66 @@ impl Flow {
         }
     }
 
-    fn generate(&mut self) -> Command {
-        // Fair value drifts one tick at a time.
+    /// The next command of a scheduled trading day.
+    fn scheduled(&mut self, schedule: Schedule) -> Command {
+        let first_day = self.step < schedule.day_len();
+        let at = self.step % schedule.day_len();
+        self.step += 1;
+        let opening_uncross = 1 + schedule.opening_call;
+        let closing_start = opening_uncross + 2 + schedule.continuous;
+        if at == 0 {
+            Command::StartCall {
+                reference: first_day.then_some(self.config.start_price),
+            }
+        } else if at == opening_uncross || at == schedule.day_len() - 1 {
+            Command::Uncross
+        } else if at == opening_uncross + 1 {
+            Command::Resume
+        } else if at == closing_start {
+            Command::StartCall { reference: None }
+        } else if self.shadow.phase() == Phase::Call {
+            self.generate_call()
+        } else {
+            self.generate()
+        }
+    }
+
+    /// Fair value drifts one tick at a time.
+    fn drift(&mut self) {
         match self.rng.below(1000) {
             0..3 => self.fair += 1,
             3..6 => self.fair = (self.fair - 1).max(10),
             _ => {}
         }
+    }
+
+    /// A cancel or modify of a resting order, if `cancel` or `modify` is set and one rests.
+    fn maintain(&mut self, cancel: bool, modify: bool) -> Option<Command> {
+        if !(cancel || modify) {
+            return None;
+        }
+        let id = self.pick_live()?;
+        if cancel {
+            return Some(Command::Cancel { id });
+        }
+        let resting = self.shadow.order(id).expect("picked order rests");
+        let price = match self.rng.below(4) {
+            0 | 1 => resting.price,
+            2 => resting.price + 1,
+            _ => (resting.price - 1).max(1),
+        };
+        Some(Command::Modify {
+            id,
+            price,
+            qty: self.qty(),
+        })
+    }
+
+    /// A call-phase command: cancels and modifies as in continuous trading, GTC market
+    /// orders, and GTC limit orders that reach up to two ticks through fair value, so buyers
+    /// and sellers overlap.
+    fn generate_call(&mut self) -> Command {
+        self.drift();
         let mut roll = self.rng.below(1000);
         let mut take = |share: u64| {
             let hit = roll < share;
@@ -259,23 +356,43 @@ impl Flow {
         };
         let cancel = take(self.cancel_share());
         let modify = !cancel && take(self.config.modify);
-        if (cancel || modify)
-            && let Some(id) = self.pick_live()
-        {
-            if cancel {
-                return Command::Cancel { id };
-            }
-            let resting = self.shadow.order(id).expect("picked order rests");
-            let price = match self.rng.below(4) {
-                0 | 1 => resting.price,
-                2 => resting.price + 1,
-                _ => (resting.price - 1).max(1),
+        let market = take(self.config.market);
+        if let Some(command) = self.maintain(cancel, modify) {
+            return command;
+        }
+        let side = self.side();
+        let order = if market {
+            self.order(side, OrderKind::Market, TimeInForce::Gtc, false)
+        } else {
+            let reach = 3 - self.depth_offset();
+            let price = match side {
+                Side::Buy => self.fair + reach,
+                Side::Sell => self.fair - reach,
             };
-            return Command::Modify {
-                id,
-                price,
-                qty: self.qty(),
-            };
+            let order = self.order(
+                side,
+                OrderKind::Limit(price.max(1)),
+                TimeInForce::Gtc,
+                false,
+            );
+            self.live.push(order.id);
+            order
+        };
+        Command::New(order)
+    }
+
+    fn generate(&mut self) -> Command {
+        self.drift();
+        let mut roll = self.rng.below(1000);
+        let mut take = |share: u64| {
+            let hit = roll < share;
+            roll = roll.saturating_sub(share);
+            hit
+        };
+        let cancel = take(self.cancel_share());
+        let modify = !cancel && take(self.config.modify);
+        if let Some(command) = self.maintain(cancel, modify) {
+            return command;
         }
 
         let side = self.side();
@@ -320,7 +437,10 @@ impl Iterator for Flow {
     type Item = Command;
 
     fn next(&mut self) -> Option<Command> {
-        let command = self.generate();
+        let command = match self.config.session {
+            Some(schedule) => self.scheduled(schedule),
+            None => self.generate(),
+        };
         self.scratch.clear();
         self.shadow.process(&command, &mut self.scratch);
         Some(command)

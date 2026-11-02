@@ -6,7 +6,7 @@
 use std::hint::black_box;
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
-use crossbook::flow::{Flow, FlowConfig};
+use crossbook::flow::{Flow, FlowConfig, Schedule};
 use crossbook::reference::ReferenceEngine;
 use crossbook::{Command, Engine, NewOrder, Side};
 
@@ -120,5 +120,38 @@ fn sessions(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, operations, sessions);
+/// The closing call of the first trading day, just before its uncross: the continuous book
+/// plus 5,000 call-phase commands, crossed over several ticks with market orders waiting.
+fn closing_call() -> Engine {
+    let schedule = Schedule::default();
+    let config = FlowConfig {
+        session: Some(schedule),
+        ..FlowConfig::seeded(42)
+    };
+    let mut engine = Engine::new();
+    let mut events = Vec::new();
+    for command in Flow::new(config).take(schedule.day_len() - 1) {
+        engine.process(&command, &mut events);
+        events.clear();
+    }
+    engine
+}
+
+fn auctions(c: &mut Criterion) {
+    let book = closing_call();
+    let mut group = c.benchmark_group("auctions");
+    group.bench_function("indicative uncross, closing call book", |b| {
+        b.iter(|| black_box(book.indicative_uncross()));
+    });
+    group.bench_function("uncross, closing call book", |b| {
+        b.iter_batched_ref(
+            || (book.clone(), Vec::with_capacity(8_192)),
+            |(engine, events)| engine.process(black_box(&Command::Uncross), events),
+            BatchSize::LargeInput,
+        );
+    });
+    group.finish();
+}
+
+criterion_group!(benches, operations, sessions, auctions);
 criterion_main!(benches);

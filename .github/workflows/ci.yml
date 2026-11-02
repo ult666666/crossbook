@@ -40,14 +40,24 @@ jobs:
           PROPTEST_CASES: ${{ runner.os == 'Linux' && '4096' || '512' }}
       - name: Differential check on one million synthetic commands
         run: cargo run --release -p crossbook-cli -- verify --orders 1000000 --seed 7
+      - name: Differential check on ten trading days with auctions
+        run: cargo run --release -p crossbook-cli -- verify --orders 1000000 --seed 7 --auctions
       - name: Same output for every shard count
         run: cargo run --release -p crossbook-cli -- exchange --orders 300000 --symbols 32 --shards 1,2,3,4,7 --runs 1
+      - name: Same output for every shard count, with auctions
+        run: cargo run --release -p crossbook-cli -- exchange --orders 300000 --symbols 32 --shards 1,2,3,4,7 --runs 1 --auctions
       - name: Crash recovery on one million commands
         if: runner.os == 'Linux'
         run: scripts/check-recovery.sh 1000000 42
+      - name: Crash recovery inside a call phase, with auctions
+        if: runner.os == 'Linux'
+        run: scripts/check-recovery.sh 1000000 42 auctions
       - name: Market data rebuilt from the feed on one million commands
         if: runner.os == 'Linux'
         run: cargo run --release -p crossbook-cli -- feed --orders 1000000
+      - name: Market data rebuilt from the feed through auctions
+        if: runner.os == 'Linux'
+        run: cargo run --release -p crossbook-cli -- feed --orders 1000000 --auctions
       - name: Documentation
         if: runner.os == 'Linux'
         run: cargo doc --workspace --no-deps
@@ -80,6 +90,8 @@ jobs:
           node-version: 22
       - name: Native and WebAssembly builds agree on one million commands
         run: scripts/check-determinism.sh 1000000 42
+      - name: Native and WebAssembly builds agree on one million commands with auctions
+        run: scripts/check-determinism.sh 1000000 42 auctions
       - name: Build the playground
         run: scripts/build-web.sh
       - name: Browser smoke test
