@@ -799,6 +799,13 @@ input[type='number']::-webkit-outer-spin-button {
   font-size: 15px;
 }
 
+/* The label is redrawn when a ticket field changes, which happens when that field loses
+   focus at the start of a click. Without this, a click that started on a redrawn number
+   lost its target and never submitted. Now the button itself receives every click. */
+#submit-label {
+  pointer-events: none;
+}
+
 .submit.is-buy {
   background: var(--bid-solid);
   color: var(--on-bid-solid);

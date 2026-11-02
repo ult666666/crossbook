@@ -134,6 +134,21 @@ async function main() {
       check(!(await page.isHidden('#start-call')) && (await page.isHidden('#uncross-btn')), 'phase buttons did not switch');
     });
 
+    await step('phase buttons keep keyboard focus when they hide themselves', async () => {
+      const focused = () => page.evaluate(() => document.activeElement?.id || document.activeElement?.tagName);
+      await page.click('#clear-book');
+      await page.focus('#start-call');
+      await page.keyboard.press('Enter');
+      await page.waitForFunction(() => document.getElementById('phase-label').textContent.startsWith('Call phase'));
+      let id = await focused();
+      check(id === 'uncross-btn', `focus went to ${id} after starting the call`);
+      await page.focus('#resume-btn');
+      await page.keyboard.press('Enter');
+      await page.waitForFunction(() => document.getElementById('phase-label').textContent === 'Continuous trading');
+      id = await focused();
+      check(id === 'start-call', `focus went to ${id} after resuming`);
+    });
+
     let orderId = '';
     await step('ticket places an order that rests on the book', async () => {
       await page.click('[data-field="side"] button[data-value="sell"]');
@@ -162,6 +177,24 @@ async function main() {
       check((await event.count()) === 1, 'no CANCELED event for the canceled order');
       const text = await event.textContent();
       check(text.includes(`#${orderId}`) && text.includes('canceled on request'), `unexpected cancel text: "${text}"`);
+    });
+
+    await step('the ticket button places an order on the first click after typing', async () => {
+      // Clicking the button blurs the field, and the field's change handler redraws the
+      // button label. A click that lands on a number in the label must still submit.
+      const before = await page.locator('#log-list > li').count();
+      await page.click('#qty', { clickCount: 3 });
+      await page.keyboard.type('4');
+      await page.locator('#submit-label .num').first().click();
+      const placed = await page
+        .waitForFunction((count) => document.querySelectorAll('#log-list > li').length > count, before, {
+          timeout: 3_000,
+        })
+        .then(
+          () => true,
+          () => false,
+        );
+      check(placed, 'the first click on the ticket button after typing a quantity placed no order');
     });
 
     await step('100,000-command stress test matches the native build', async () => {
