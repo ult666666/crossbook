@@ -190,6 +190,25 @@ bid is below the best ask.
 `Engine::indicative_uncross` returns the same price, volume and surplus without executing,
 which is what exchanges publish during a call.
 
+`cargo run --release -p crossbook-cli -- auction` walks through an opening call and
+prints the indicative uncross after each order. After its last order, 13 lots can trade at
+101, and the uncross fills them in this order:
+
+```text
+# 8 lots can trade at 100 or 101, both with 2 lots left to sell: with sellers in excess, the lower price
+  accepted #4 buy 3 @ 101
+  booked #4 buy 3 @ 101
+  indicative uncross: 8 lots @ 100, surplus 2 sell
+
+# The uncross: every crossing order trades at 101, market orders first, then better prices, then earlier orders
+  auction trade 2 @ 101 (buy #5, sell #1)
+  auction trade 4 @ 101 (buy #3, sell #1)
+  auction trade 1 @ 101 (buy #3, sell #2)
+  auction trade 3 @ 101 (buy #4, sell #2)
+  auction trade 3 @ 101 (buy #8, sell #6)
+  uncrossed at 101: 13 lots, surplus 1 buy
+```
+
 ## Event reference
 
 | Event | Meaning |
