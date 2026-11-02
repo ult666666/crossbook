@@ -21,8 +21,9 @@ different way to be wrong.
 | Browser smoke test | `web/smoke.mjs` | The playground loads, runs scenarios and the stress test |
 | Mutation testing | `cargo mutants` | Tests that pass no matter what the code does |
 
-Run everything locally with `cargo test --workspace`. CI also runs 4,096 property cases,
-a one-million-command differential check, the WebAssembly comparison, crash recovery on
+Run everything locally with `cargo test --workspace`. Each property test runs 1,024
+cases by default; set `PROPTEST_CASES` to change that. CI runs 4,096 cases on Linux and
+512 on macOS and Windows, plus a one-million-command differential check, the WebAssembly comparison, crash recovery on
 one million commands, the shard check on three operating systems and the browser smoke
 test, each also on ten synthetic trading days with opening and closing auctions
 (`--auctions`). The generators for random command streams live in `tests/common/mod.rs` and are
@@ -75,11 +76,20 @@ with linear scans.
 
 `tests/auction.rs` compares the two on small books: up to 13 orders on five price levels,
 one to four lots each, one in six a market order, with and without a reference price.
-Small books tie often, so every rule gets exercised; a seeded run of 20,000 books checks
-that it does. On those books the deciding rule was volume for 6,895, surplus for 4,762,
-market pressure for 2,017, the reference price for 346 and the lowest price for 126; 593
-books held only market orders and 5,261 could not trade (`cargo test -p crossbook --release
---test auction -- --nocapture`). The test fails if any rule decides fewer than 100.
+A property test draws new random books on every run. Small books tie often, so every rule
+gets exercised, and a second test checks that on 20,000 seeded books. It fails if any
+outcome below decides fewer than 100 books. The counts come from
+`cargo test -p crossbook --release --test auction -- --nocapture`:
+
+| What decided the price | Books |
+| --- | ---: |
+| Volume | 6,895 |
+| Surplus | 4,762 |
+| Market pressure | 2,017 |
+| Reference price | 346 |
+| Lowest price | 126 |
+| Only market orders on the book | 593 |
+| Nothing could trade | 5,261 |
 
 After every uncross, in these tests and in the differential and flow tests,
 `check_uncross` verifies against the book just before it:
@@ -97,8 +107,8 @@ After every uncross, in these tests and in the differential and flow tests,
 Scenario tests in `semantics.rs` pin each rule and each order type's behavior in a call
 phase to exact events, including tie cases where a later rule decides.
 
-**Hand-written mutants.** Seven bugs were injected one at a time into the auction code and
-run against the auction, scenario and differential tests, which caught all seven: market
+Seven bugs were also written by hand into the auction code, one at a time, and run
+against the auction, scenario and differential tests. The tests caught all seven: market
 pressure choosing the wrong end, the final tie-break taking the higher price, the surplus
 rule skipped, market orders filling after limit orders, orders at the clearing price unable
 to fill on the sell side, market remainders left on the book, and `Resume` skipping the
@@ -189,8 +199,10 @@ Passing tests prove little if they would also pass with a broken engine. Mutatio
 changes the code on purpose (flips a comparison, deletes a statement, returns a
 constant) and checks that some test fails.
 
-**Hand-written mutants.** Six realistic bugs were injected one at a time and run against
-the scenario and differential suites. The suites failed for all six:
+### Hand-written mutants
+
+Six realistic bugs were injected one at a time and run against the scenario and
+differential suites. The suites failed for all six:
 
 - fill-or-kill ignores the cancel-oldest skip;
 - buy orders match the worst ask first;
@@ -199,13 +211,22 @@ the scenario and differential suites. The suites failed for all six:
 - a fill does not reduce the level's cached total;
 - the post-only check looks at the wrong side of the book.
 
-**cargo-mutants.** A full run over `engine.rs`, `types.rs` and `codec.rs` generated 168
-mutants (hasher internals, capacity hints, `Display` text and the invariant checker
-itself were excluded). 20 did not compile. Of the other 148, the tests caught 140, two of
-them by timing out because the mutant looped forever. The 8 survivors:
+### cargo-mutants
+
+Three runs covered the code as it grew. Mutants that time out (they loop forever) count as
+caught.
+
+| Run | Mutants | Did not compile | Caught | Survived |
+| --- | ---: | ---: | ---: | ---: |
+| Engine: `engine.rs`, `types.rs`, `codec.rs` | 168 | 20 | 140 | 8 |
+| The 0.2 modules, rerun after closing 14 gaps | 182 | 7 | 165 | 10 |
+| The 0.3 auction code | 325 | 2 | 310 | 13 |
+
+The first run excluded hasher internals, capacity hints, `Display` text and the invariant
+checker itself, and two of its catches were timeouts. Its 8 survivors:
 
 - `is_empty` returning `true`, `level_count` returning a constant, and quantity
-  `MAX_QTY` itself being rejected: real gaps, now covered by new assertions;
+  `MAX_QTY` itself being rejected: gaps in the tests, now covered by new assertions;
 - two link fields set in `modify` that `link_back` always overwrites: redundant code,
   now deleted;
 - two capacity hints in `with_capacity`: removing them changes allocation, not behavior.
@@ -219,14 +240,13 @@ cargo mutants -p crossbook --file crates/crossbook/src/engine.rs \
   --exclude-re 'IdHasher|with_capacity|check_invariants|fmt'
 ```
 
-**The 0.2 modules.** A second run covered `snapshot.rs`, `recovery.rs`,
-`market_data.rs` and `exchange.rs`: 182 mutants, 7 of which did not compile. The first
-pass caught 151 of the other 175. The 24 survivors pointed at 14 real gaps, among them
+The second run covered `snapshot.rs`, `recovery.rs`, `market_data.rs` and
+`exchange.rs`. Its first pass left 24 survivors, which pointed at 14 gaps, among them
 routing every instrument to one shard (correct output, no parallelism), a publisher
 check weakened so that a trade could hit an order on the wrong side or at another price,
 the subscriber's sequence and sync accessors, the cause chained by recovery errors, and
-exact snapshot length boundaries. Tests now cover all 14, and the rerun caught 165 of
-175. The 10 survivors:
+exact snapshot length boundaries. Tests now cover all 14, and the rerun left 10
+survivors:
 
 - 7 in `exchange::run` change only buffer recycling or the capacity of the queues that
   return spare buffers: the output is identical, only allocation changes;
@@ -239,12 +259,10 @@ cargo mutants -p crossbook --file crates/crossbook/src/snapshot.rs \
   --file crates/crossbook/src/exchange.rs --exclude-re 'fmt|Display|SymbolHasher'
 ```
 
-**The 0.3 auction code.** A third run covered only the code added for call auctions: all of
-`auction.rs`, the phase, uncross and allocation functions in `engine.rs`, `static_reject`,
-the new codec frames, the journal and snapshot version handling, the publisher's auction
-handling and the session schedule. It generated 325 mutants, 2 of which did not compile.
-The tests caught 307, and 3 more by timing out because the mutant looped forever. The 13
-survivors:
+The third run covered only the code added for call auctions: all of `auction.rs`, the
+phase, uncross and allocation functions in `engine.rs`, `static_reject`, the new codec
+frames, the journal and snapshot version handling, the publisher's auction handling and the
+session schedule. Three of its catches were timeouts. The 13 survivors:
 
 - 5 showed code that could change without any visible effect, or an untested case, and
   are fixed: the allocation walk kept collecting zero-lot fills after the volume was covered
@@ -259,8 +277,8 @@ survivors:
 - 2 delete the capacity hints in `Engine::with_capacity`, which change allocation, not
   behavior (the first run found the same).
 
-A rerun of the 126 mutants in the changed functions caught 118 and left exactly the 8
-equivalent ones listed above. The reported runs limited `snapshot::decode` to the lines
+A rerun of the 126 mutants in the changed functions left only the 8 equivalent ones
+listed above. The reported runs limited `snapshot::decode` to the lines
 that changed (by line number); the command below selects whole functions, so it also
 repeats the 0.2 checks in `decode`. The lower case counts keep a run near 20 minutes on
 a 4-vCPU machine.

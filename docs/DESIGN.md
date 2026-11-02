@@ -6,13 +6,13 @@ This document explains how it is built and why. The exact matching rules are in
 
 ## Goals, in order
 
-1. **Correct.** Every rule is written down, tested by scenario, and cross-checked against
-   a second implementation.
-2. **Deterministic.** The same commands produce the same events and the same book on any
+1. Correct: every rule is written down, tested by scenario, and cross-checked against a
+   second implementation.
+2. Deterministic: the same commands produce the same events and the same book on any
    machine, including WebAssembly in a browser.
-3. **Fast enough to matter.** Tens of millions of commands per second on one core, with
+3. Fast enough to matter: tens of millions of commands per second on one core, with
    latency measured per command, so data-structure choices show up in the numbers.
-4. **Small and readable.** One library crate with no dependencies and no `unsafe`.
+4. Small and readable: one library crate with no dependencies and no `unsafe`.
 
 ## Shape of the system
 
@@ -51,19 +51,19 @@ bids: BTreeMap<Price, Level>          asks: BTreeMap<Price, Level>
    index: HashMap<OrderId, u32>         free list: Vec<u32>
 ```
 
-- **Price levels** live in one `BTreeMap` per side. The best ask is the first key and the
-  best bid is the last, and walking the map visits levels in priority order, which is
-  exactly what a sweep needs.
-- **Orders** are nodes in a single slab (`Vec<Node>`). Each level is a doubly linked FIFO
+- Price levels live in one `BTreeMap` per side. The best ask is the first key and the
+  best bid is the last, and walking the map visits levels in priority order, which is the
+  order a sweep needs.
+- Orders are nodes in a single slab (`Vec<Node>`). Each level is a doubly linked FIFO
   queue threaded through the slab with `u32` indices. Appending to a level and removing
   any node are O(1), so a cancel from the middle of a long queue costs the same as a
   cancel at the front. Freed slots go on a free list and are reused, so a long session
   does not keep growing the slab.
-- **Ids** map to slab slots through a hash map with a small multiplicative hasher
+- Ids map to slab slots through a hash map with a small multiplicative hasher
   (FxHash with a final fold). Order ids are trusted input here. A gateway facing untrusted
   clients would assign ids itself or use a keyed hasher, because a fixed hash function
   lets an attacker choose colliding ids.
-- **Levels cache** their total quantity and order count, so depth queries do not walk
+- Levels cache their total quantity and order count, so depth queries do not walk
   queues.
 
 `u32` links keep a node at 48 bytes (a test pins the size) and give a free sentinel value
@@ -88,18 +88,18 @@ fill-or-kill check walks.
 
 ## Why not something else
 
-**A `VecDeque` per level.** Simple, and fine for the front of the queue, but cancelling
-an order in the middle is O(queue length). Cancels are the most common message in real
+A `VecDeque` per level is simple, and fine for the front of the queue, but cancelling an
+order in the middle is O(queue length). Cancels are the most common message in real
 order flow, so the intrusive list wins.
 
-**A dense price ladder** (an array indexed by price offset). Level lookup becomes O(1)
+A dense price ladder (an array indexed by price offset) makes level lookup O(1)
 and the CPU cache likes it, but it needs a bounded price band, a rebasing story when the
 market moves out of it, and a scan to find the next best price after a level empties.
 The tree keeps the code general. With about 30 to 45 active levels per side in the
-synthetic flow, tree depth is small; a ladder is the natural next experiment, and the benchmark
-harness exists to measure it honestly.
+synthetic flow, tree depth is small; a ladder is the natural next experiment, and the
+benchmark harness can measure it.
 
-**Several threads.** Matching for one instrument is sequential by definition: each
+Several threads would not help one book. Matching for one instrument is sequential: each
 order's outcome depends on every order before it. Exchanges scale by sequencing input
 on one thread per instrument (or per partition) and spreading instruments across cores.
 Network I/O, risk checks and market data would sit around this core on other threads;
@@ -117,7 +117,7 @@ The engine's output depends only on its input commands:
   the same stream on every platform.
 
 To make this checkable, `digest::Fingerprint` hashes events and books with FNV-1a over an
-explicit little-endian encoding. It deliberately avoids `std::hash`, whose output is not
+explicit little-endian encoding. It avoids `std::hash`, whose output is not
 guaranteed to stay the same across Rust releases. CI pins the fingerprints of a 100,000
 command session on x86-64 Linux, ARM64 macOS and x86-64 Windows, and compares a
 1,000,000 command session between the native build and the WebAssembly build.
@@ -286,17 +286,17 @@ ticks.
 
 ### Order types in the call phase
 
-- **Limit and market orders** rest. Market orders wait in one FIFO queue per side, ahead of
+- Limit and market orders rest. Market orders wait in one FIFO queue per side, ahead of
   every limit order, as on Euronext. Whatever part the uncross does not fill is canceled,
   because crossbook's continuous trading never rests a market order.
-- **IOC and FOK** are rejected. Both promise immediate execution, which a call cannot give;
+- IOC and FOK orders are rejected. Both promise immediate execution, which a call cannot give;
   Euronext rejects IOC in the call phase and accepts FOK only in continuous trading and
   trading at last.
-- **Post-only** orders are rejected, and resting ones are canceled when a call starts. This
+- Post-only orders are rejected, and resting ones are canceled when a call starts. This
   follows Xetra's book-or-cancel orders, which are deleted from the book at the start of an
   auction and rejected during it, because auction volume counts as aggressive
   ([Xetra execution conditions](https://eurexrepo.com/xetra-en/trading/order-types/execution-conditions)).
-- **Self-trade prevention** does not apply at the uncross. Canceling an order after its
+- Self-trade prevention does not apply at the uncross. Canceling an order after its
   quantity set the price would make the published price and volume wrong. Deutsche Börse
   likewise applies self-match prevention in continuous trading only
   ([Enhancements of Self-Match Prevention](https://deutsche-boerse.com/resource/blob/4680814/416dde8418241712e16ceda42113caae/data/Enhancements%20of%20Self-Match%20Prevention.pdf)).

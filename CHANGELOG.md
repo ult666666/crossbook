@@ -5,7 +5,17 @@ before 1.0, a minor version may change the public API.
 
 ## Unreleased
 
+### Changed
+
+- Playground: section labels, event types and table headings use sentence case instead of
+  small capitals, and the footer gives the name, the source link and the license.
+- The README is shorter. The test counts and mutation-testing results it listed are in
+  `docs/TESTING.md`, and the benchmark details in `docs/BENCHMARKS.md`.
+
 ### Fixed
+
+- Playground: at phone width, the table of reference digests was wider than the screen
+  until a stress test ran.
 
 - Playground: the first click on the order button right after typing a price or quantity
   could place no order. Leaving the field redrew the button's label under the pointer, and
