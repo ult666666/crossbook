@@ -3,16 +3,21 @@
 //! Every message is a fixed size chosen by its first byte, with little-endian integers
 //! and zeroed reserved bytes, so a decoder never allocates and never guesses:
 //!
-//! | type | message  | bytes | layout                                                                 |
-//! |------|----------|-------|------------------------------------------------------------------------|
-//! | 1    | `New`    | 40    | type, side, kind, tif, flags, stp, 2 reserved, id u64, account u32, 4 reserved, price i64, qty u64 |
-//! | 2    | `Cancel` | 16    | type, 7 reserved, id u64                                               |
-//! | 3    | `Modify` | 32    | type, 7 reserved, id u64, price i64, qty u64                           |
+//! | type | message     | bytes | layout                                                              |
+//! |------|-------------|-------|---------------------------------------------------------------------|
+//! | 1    | `New`       | 40    | type, side, kind, tif, flags, stp, 2 reserved, id u64, account u32, 4 reserved, price i64, qty u64 |
+//! | 2    | `Cancel`    | 16    | type, 7 reserved, id u64                                            |
+//! | 3    | `Modify`    | 32    | type, 7 reserved, id u64, price i64, qty u64                        |
+//! | 4    | `StartCall` | 16    | type, flags, 6 reserved, reference price i64                        |
+//! | 5    | `Uncross`   | 8     | type, 7 reserved                                                    |
+//! | 6    | `Resume`    | 8     | type, 7 reserved                                                    |
 //!
 //! Field codes: side 0 buy / 1 sell; kind 0 limit / 1 market; tif 0 GTC / 1 IOC / 2 FOK;
-//! flags bit 0 post-only; stp 0 allow / 1 cancel newest / 2 cancel oldest / 3 cancel both.
-//! A market order carries price 0. The decoder checks syntax only; the engine still
-//! validates quantities, prices and book state.
+//! `New` flags bit 0 post-only; stp 0 allow / 1 cancel newest / 2 cancel oldest / 3 cancel
+//! both; `StartCall` flags bit 0 a reference price is present. A market order, and a
+//! `StartCall` without a reference price, carry price 0. Types 4 to 6 arrived with call
+//! auctions in version 2 of the journal format. The decoder checks syntax only; the engine
+//! still validates quantities, prices and book state.
 
 use core::fmt;
 
@@ -25,10 +30,32 @@ pub const NEW_LEN: usize = 40;
 pub const CANCEL_LEN: usize = 16;
 /// Encoded size of a `Modify` message.
 pub const MODIFY_LEN: usize = 32;
+/// Encoded size of a `StartCall` message.
+pub const START_CALL_LEN: usize = 16;
+/// Encoded size of an `Uncross` or `Resume` message.
+pub const PHASE_LEN: usize = 8;
+/// The largest encoded message.
+pub const MAX_LEN: usize = NEW_LEN;
 
 const TYPE_NEW: u8 = 1;
 const TYPE_CANCEL: u8 = 2;
 const TYPE_MODIFY: u8 = 3;
+const TYPE_START_CALL: u8 = 4;
+const TYPE_UNCROSS: u8 = 5;
+const TYPE_RESUME: u8 = 6;
+
+/// Encoded size of a message with type byte `kind`, or `None` for an unknown type.
+#[must_use]
+pub const fn frame_len(kind: u8) -> Option<usize> {
+    match kind {
+        TYPE_NEW => Some(NEW_LEN),
+        TYPE_CANCEL => Some(CANCEL_LEN),
+        TYPE_MODIFY => Some(MODIFY_LEN),
+        TYPE_START_CALL => Some(START_CALL_LEN),
+        TYPE_UNCROSS | TYPE_RESUME => Some(PHASE_LEN),
+        _ => None,
+    }
+}
 
 /// Why bytes could not be decoded into a command.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,6 +108,8 @@ pub const fn encoded_len(command: &Command) -> usize {
         Command::New(_) => NEW_LEN,
         Command::Cancel { .. } => CANCEL_LEN,
         Command::Modify { .. } => MODIFY_LEN,
+        Command::StartCall { .. } => START_CALL_LEN,
+        Command::Uncross | Command::Resume => PHASE_LEN,
     }
 }
 
@@ -123,6 +152,13 @@ pub fn encode(command: &Command, buf: &mut Vec<u8>) {
             buf.extend_from_slice(&price.to_le_bytes());
             buf.extend_from_slice(&qty.to_le_bytes());
         }
+        Command::StartCall { reference } => {
+            let flags = u8::from(reference.is_some());
+            buf.extend_from_slice(&[TYPE_START_CALL, flags, 0, 0, 0, 0, 0, 0]);
+            buf.extend_from_slice(&reference.unwrap_or(0).to_le_bytes());
+        }
+        Command::Uncross => buf.extend_from_slice(&[TYPE_UNCROSS, 0, 0, 0, 0, 0, 0, 0]),
+        Command::Resume => buf.extend_from_slice(&[TYPE_RESUME, 0, 0, 0, 0, 0, 0, 0]),
     }
 }
 
@@ -138,11 +174,8 @@ pub fn decode(buf: &[u8]) -> Result<(Command, usize), DecodeError> {
             available: 0,
         });
     };
-    let needed = match kind {
-        TYPE_NEW => NEW_LEN,
-        TYPE_CANCEL => CANCEL_LEN,
-        TYPE_MODIFY => MODIFY_LEN,
-        other => return Err(DecodeError::UnknownType(other)),
+    let Some(needed) = frame_len(kind) else {
+        return Err(DecodeError::UnknownType(kind));
     };
     if buf.len() < needed {
         return Err(DecodeError::Truncated {
@@ -159,12 +192,36 @@ pub fn decode(buf: &[u8]) -> Result<(Command, usize), DecodeError> {
                 id: u64_at(frame, 8),
             }
         }
-        _ => {
+        TYPE_MODIFY => {
             reserved(&frame[1..8])?;
             Command::Modify {
                 id: u64_at(frame, 8),
                 price: i64_at(frame, 16),
                 qty: u64_at(frame, 24),
+            }
+        }
+        TYPE_START_CALL => {
+            reserved(&frame[2..8])?;
+            let price = i64_at(frame, 8);
+            let reference = match frame[1] {
+                0 if price == 0 => None,
+                0 => return Err(DecodeError::NonZeroReserved),
+                1 => Some(price),
+                value => {
+                    return Err(DecodeError::InvalidField {
+                        field: "flags",
+                        value,
+                    });
+                }
+            };
+            Command::StartCall { reference }
+        }
+        _ => {
+            reserved(&frame[1..8])?;
+            if kind == TYPE_UNCROSS {
+                Command::Uncross
+            } else {
+                Command::Resume
             }
         }
     };
@@ -276,6 +333,70 @@ mod tests {
         assert_eq!(&buf[24..32], &10_050i64.to_le_bytes());
         assert_eq!(&buf[32..40], &25u64.to_le_bytes());
         assert_eq!(decode(&buf), Ok((Command::New(order), NEW_LEN)));
+    }
+
+    #[test]
+    fn phase_command_layouts_are_stable() {
+        let mut buf = Vec::new();
+        encode(
+            &Command::StartCall {
+                reference: Some(-2),
+            },
+            &mut buf,
+        );
+        assert_eq!(&buf[..8], &[4, 1, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(&buf[8..], &(-2i64).to_le_bytes());
+        encode(&Command::StartCall { reference: None }, &mut buf);
+        encode(&Command::Uncross, &mut buf);
+        encode(&Command::Resume, &mut buf);
+        assert_eq!(
+            &buf[16..32],
+            &[4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            &buf[32..],
+            &[5, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0]
+        );
+        let mut at = 0;
+        for expected in [
+            Command::StartCall {
+                reference: Some(-2),
+            },
+            Command::StartCall { reference: None },
+            Command::Uncross,
+            Command::Resume,
+        ] {
+            let (command, len) = decode(&buf[at..]).unwrap();
+            assert_eq!((command, len), (expected, encoded_len(&expected)));
+            at += len;
+        }
+        // No reference price, but price bytes: not canonical.
+        let mut absent = buf[16..32].to_vec();
+        absent[15] = 1;
+        assert_eq!(decode(&absent), Err(DecodeError::NonZeroReserved));
+        absent[15] = 0;
+        absent[1] = 2;
+        assert_eq!(
+            decode(&absent),
+            Err(DecodeError::InvalidField {
+                field: "flags",
+                value: 2
+            })
+        );
+        absent[1] = 0;
+        absent[7] = 1;
+        assert_eq!(decode(&absent), Err(DecodeError::NonZeroReserved));
+        let mut uncross = buf[32..40].to_vec();
+        uncross[7] = 1;
+        assert_eq!(decode(&uncross), Err(DecodeError::NonZeroReserved));
+        assert_eq!(
+            decode(&buf[32..39]),
+            Err(DecodeError::Truncated {
+                needed: PHASE_LEN,
+                available: 7
+            })
+        );
+        assert_eq!(frame_len(7), None);
     }
 
     #[test]

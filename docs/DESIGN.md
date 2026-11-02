@@ -21,6 +21,7 @@ flowchart LR
     F[Flow generator<br/>seeded, synthetic] -->|Command| E
     J[Journal file<br/>binary frames] -->|Command| E
     W[Browser playground<br/>WebAssembly] -->|Command| E
+    S[Venue schedule<br/>StartCall, Uncross, Resume] -->|Command| E
     E[Engine::process] -->|Event list| O[Caller]
     E -.same rules.- R[ReferenceEngine<br/>linear scans]
 ```
@@ -238,12 +239,114 @@ several cores' caches. Three or four shards plus the sequencer and the merger ne
 threads than the machine has cores, so those results vary the most. The sequencer and
 merger are serial stages, so they bound the speedup however many shards run.
 
+## Call auctions
+
+Exchanges open and close the day with a call auction, and reopen with one after a halt.
+Orders collect during a call phase without matching, so the book may cross; the uncross
+then picks one clearing price and executes every crossing order at it. Concentrating
+liquidity at one moment and one price gives a fairer opening and closing price than the
+first or last continuous trade. [SEMANTICS.md](SEMANTICS.md#trading-phases-and-call-auctions)
+states the contract; this section covers how it is built and why.
+
+### The rules and their sources
+
+For each candidate price `p` the engine computes demand `D(p)` (market buys plus bids at or
+above `p`) and supply `S(p)` (market sells plus asks at or below `p`). Then, keeping only
+the candidates that tie after each step:
+
+1. the highest executable volume `min(D, S)`;
+2. the lowest surplus `|D - S|`;
+3. market pressure: with a buy surplus at every remaining candidate, the highest price; with
+   a sell surplus at every one, the lowest;
+4. the price closest to the reference price, which is the price given to `StartCall`,
+   otherwise the last trade;
+5. the lowest remaining price.
+
+Rules 1 to 4 follow Deutsche Börse's market model for Xetra
+([T7 Release 14.0 Market Model for the Trading Venue Xetra](https://www.cashmarket.deutsche-boerse.com/resource/blob/4805606/2b26aa5a6fd8cf9dca6743b674e7317f/data/T7_Release_14.0_-_Market_Model%20_Xetra.pdf)):
+the auction price is the price with the highest executable volume and the lowest surplus;
+if several remain, the highest one when the surplus is on the buy side at all of them and
+the lowest when it is on the sell side; otherwise the reference price, the last price from
+an auction or continuous trading, decides. A book that holds only market orders executes at
+the reference price, and during the call participants see the indicative price, its
+executable volume and the side and size of the surplus, which `indicative_uncross` returns.
+Euronext's cash market uses the same first two steps and the reference price as a further
+criterion, and gives market orders priority over orders limited at the uncrossing price
+([Euronext Trading Manual, 2022](https://www.euronext.com/sites/default/files/2022-03/Notice%204-01%20Trading%20Manual%20with%20universal%20reservation_2022_03_14_0.pdf)).
+
+crossbook differs from Xetra in one place. When the reference price lies between the
+highest and the lowest remaining candidate, Xetra sets the auction price to the reference
+price itself
+([Wiener Börse's edition of the Xetra T7 market model](https://www.wienerborse.at/uploads/u/cms/files/trading/xetra-t7-market-model-continuous-trading-and-auction.pdf)).
+crossbook takes the candidate nearest the reference price and, on an exact tie, the lower
+one. The clearing price is then always the limit of an order on the book (or the reference
+price for a book of market orders), so a brute-force check can enumerate every possible
+answer, and the final tie-break is deterministic without a midpoint that may fall between
+ticks.
+
+### Order types in the call phase
+
+- **Limit and market orders** rest. Market orders wait in one FIFO queue per side, ahead of
+  every limit order, as on Euronext. Whatever part the uncross does not fill is canceled,
+  because crossbook's continuous trading never rests a market order.
+- **IOC and FOK** are rejected. Both promise immediate execution, which a call cannot give;
+  Euronext rejects IOC in the call phase and accepts FOK only in continuous trading and
+  trading at last.
+- **Post-only** orders are rejected, and resting ones are canceled when a call starts. This
+  follows Xetra's book-or-cancel orders, which are deleted from the book at the start of an
+  auction and rejected during it, because auction volume counts as aggressive
+  ([Xetra execution conditions](https://eurexrepo.com/xetra-en/trading/order-types/execution-conditions)).
+- **Self-trade prevention** does not apply at the uncross. Canceling an order after its
+  quantity set the price would make the published price and volume wrong. Deutsche Börse
+  likewise applies self-match prevention in continuous trading only
+  ([Enhancements of Self-Match Prevention](https://deutsche-boerse.com/resource/blob/4680814/416dde8418241712e16ceda42113caae/data/Enhancements%20of%20Self-Match%20Prevention.pdf)).
+
+Phase commands are never rejected, because they come from the venue's schedule rather than
+from a participant: `Uncross` in continuous trading finds nothing to execute, `StartCall`
+in a call only replaces the reference price, and a non-positive reference price is ignored.
+`Resume` runs an uncross first when the book is crossed or holds market orders, so
+continuous trading never starts from a state it could not have produced itself.
+
+### How it is built
+
+The call book uses the same structures as continuous trading. Limit orders sit in their
+price levels, which may now cross; market orders are nodes in the same slab, linked into
+one queue per side, with price 0 as their marker (no limit price can be 0), so `Node` stays
+48 bytes. Finding the price needs only the cached level totals: one merge over both sides'
+levels in ascending price order keeps a running total of bids below the candidate and of
+asks at or below it, so `D(p)` and `S(p)` cost O(1) per candidate. Rules 2 to 5 run in the
+same pass, keeping the lowest and highest tied price, whether any tie has a buy or a sell
+surplus, and the tie nearest the reference price. The whole determination is O(L) in the
+number of levels and allocates nothing, so the indicative price can be refreshed after every
+command. The uncross then walks each side once in priority order to collect the fills,
+pairs buys with sells, and removes filled orders: O(L + k) for k fills.
+
+On the closing call of a synthetic trading day, with 8,452 resting orders on 66 price levels,
+the indicative uncross takes about 0.34 µs and the uncross, 1,608 fills for 15,313 lots,
+about 54 µs ([BENCHMARKS.md](BENCHMARKS.md#call-auctions)).
+
+### Persistence and market data
+
+The journal format gained frame types for the three phase commands (version 2), and the
+snapshot format stores the phase, the reference price, the last trade price and the
+waiting market orders (version 2). Both readers still accept version 1, and the tests read
+a journal and a snapshot written by crossbook 0.2. A crash during a call phase recovers
+into the same call, with the same market orders and reference price.
+
+The market-data feed publishes a status message for each phase change and one auction
+message per uncross with the clearing price, volume and surplus. Individual auction fills
+are private executions, so they are not printed. During a call the feed's levels cross like
+the engine's, and waiting market orders appear in no level. The feed does not yet
+publish the indicative price after each command; a subscriber would need the market order
+totals for that.
+
 ## What a production system would add
 
 This is a learning and benchmarking project, not an exchange. A real venue also needs:
 a network gateway with authentication and pre-trade risk checks, a replicated sequencer
-so a standby can take over, `fsync` policies and journal rotation, auctions and halts,
-price bands, fees, and operational controls such as kill switches. Recovery, market data
+so a standby can take over, `fsync` policies and journal rotation, volatility
+interruptions that start a call automatically, price bands, fees, and operational controls
+such as kill switches. Recovery, market data
 and multi-instrument sharding above show how the event-based interface and the
 determinism guarantees carry those pieces: each is built around the core without
 changing how it matches.

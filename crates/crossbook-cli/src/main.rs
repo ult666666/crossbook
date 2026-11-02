@@ -6,25 +6,26 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use crossbook::exchange::{self, Symbol};
-use crossbook::flow::{Flow, FlowConfig, SplitMix64};
+use crossbook::flow::{Flow, FlowConfig, Schedule, SplitMix64};
 use crossbook::market_data::{BookBuilder, Message, Publisher};
 use crossbook::reference::ReferenceEngine;
-use crossbook::{Command, Engine, Event, digest, journal, recovery, snapshot};
+use crossbook::{Command, Engine, Event, Side, digest, journal, recovery, snapshot};
 use hdrhistogram::Histogram;
 
 const USAGE: &str = "\
 crossbook: deterministic limit order book and matching engine
 
 USAGE:
-    crossbook gen     --out FILE [--orders N] [--seed S] [--book N]
+    crossbook gen     --out FILE [--orders N] [--seed S] [--book N] [--auctions]
     crossbook replay  FILE [--depth N]
-    crossbook verify  [--orders N] [--seed S] [--book N]
-    crossbook bench   [--orders N] [--seed S] [--book N] [--json]
+    crossbook verify  [--orders N] [--seed S] [--book N] [--auctions]
+    crossbook bench   [--orders N] [--seed S] [--book N] [--auctions] [--json]
     crossbook snapshot FILE --at N --out SNAPSHOT
     crossbook recover FILE [--snapshot SNAPSHOT]
-    crossbook feed    [--orders N] [--seed S] [--book N]
-    crossbook exchange [--orders N] [--symbols N] [--shards LIST] [--batch N] [--runs N] [--seed S]
+    crossbook feed    [--orders N] [--seed S] [--book N] [--auctions]
+    crossbook exchange [--orders N] [--symbols N] [--shards LIST] [--batch N] [--runs N] [--seed S] [--auctions]
     crossbook demo
+    crossbook auction
 
 COMMANDS:
     gen      Write N synthetic commands to a journal file
@@ -40,6 +41,12 @@ COMMANDS:
     exchange Run synthetic flow for many instruments on one thread and on several shard
              threads, report median throughput, and require the same output digest
     demo     Walk through a short annotated session
+    auction  Walk through an opening auction: the indicative uncross after each order,
+             then the uncross itself
+
+--auctions turns the flow into trading days: an opening call of 5,000 commands and its
+uncross, 90,000 commands of continuous trading, and a closing call of 5,000 commands and
+its uncross (100,005 commands per day).
 
 Defaults: --orders 1000000, --seed 42, --depth 5, --book 10000 (target resting orders;
 verify defaults to 1000 because the reference model scans the whole book on every
@@ -60,6 +67,7 @@ struct Args {
     shards: Vec<usize>,
     batch: usize,
     runs: usize,
+    auctions: bool,
 }
 
 fn parse(mut raw: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -77,6 +85,7 @@ fn parse(mut raw: impl Iterator<Item = String>) -> Result<Args, String> {
         shards: vec![1, 2, 3, 4],
         batch: 4096,
         runs: 3,
+        auctions: false,
     };
     while let Some(arg) = raw.next() {
         let mut value = |name: &str| raw.next().ok_or_else(|| format!("{name} needs a value"));
@@ -87,6 +96,7 @@ fn parse(mut raw: impl Iterator<Item = String>) -> Result<Args, String> {
             "--book" => args.book = Some(number(&value("--book")?)?),
             "--out" | "-o" => args.out = Some(value("--out")?),
             "--json" => args.json = true,
+            "--auctions" => args.auctions = true,
             "--at" => args.at = Some(number(&value("--at")?)?),
             "--snapshot" => args.snapshot = Some(value("--snapshot")?),
             "--symbols" => args.symbols = number(&value("--symbols")?)?,
@@ -133,6 +143,10 @@ fn main() -> ExitCode {
             demo();
             Ok(())
         }
+        Some("auction") => {
+            auction_demo();
+            Ok(())
+        }
         Some("help") | None => {
             println!("{USAGE}");
             Ok(())
@@ -148,12 +162,18 @@ fn main() -> ExitCode {
     }
 }
 
-fn synthetic(args: &Args, default_book: usize) -> Vec<Command> {
-    let config = FlowConfig {
+fn flow_config(args: &Args, seed: u64, default_book: usize) -> FlowConfig {
+    FlowConfig {
         target_orders: args.book.unwrap_or(default_book),
-        ..FlowConfig::seeded(args.seed)
-    };
-    Flow::new(config).take(args.orders).collect()
+        session: args.auctions.then(Schedule::default),
+        ..FlowConfig::seeded(seed)
+    }
+}
+
+fn synthetic(args: &Args, default_book: usize) -> Vec<Command> {
+    Flow::new(flow_config(args, args.seed, default_book))
+        .take(args.orders)
+        .collect()
 }
 
 fn generate(args: &Args) -> Result<(), String> {
@@ -162,9 +182,10 @@ fn generate(args: &Args) -> Result<(), String> {
     let file = File::create(path).map_err(|error| format!("{path}: {error}"))?;
     journal::write(BufWriter::new(file), &commands).map_err(|error| format!("{path}: {error}"))?;
     println!(
-        "wrote {} commands (seed {}) to {path}",
+        "wrote {} commands (seed {}{}) to {path}",
         group(commands.len() as u64),
-        args.seed
+        args.seed,
+        if args.auctions { ", with auctions" } else { "" }
     );
     Ok(())
 }
@@ -178,6 +199,10 @@ struct Tally {
     booked: u64,
     canceled: u64,
     modified: u64,
+    calls: u64,
+    uncrosses: u64,
+    auction_trades: u64,
+    auction_volume: u64,
 }
 
 impl Tally {
@@ -189,9 +214,16 @@ impl Tally {
                 self.trades += 1;
                 self.volume += qty;
             }
-            Event::Booked { .. } => self.booked += 1,
+            Event::Booked { .. } | Event::MarketBooked { .. } => self.booked += 1,
             Event::Canceled { .. } => self.canceled += 1,
             Event::Modified { .. } => self.modified += 1,
+            Event::CallStarted { .. } => self.calls += 1,
+            Event::AuctionTrade { qty, .. } => {
+                self.auction_trades += 1;
+                self.auction_volume += qty;
+            }
+            Event::Uncrossed { volume, .. } => self.uncrosses += u64::from(*volume > 0),
+            Event::Resumed => {}
         }
     }
 }
@@ -236,12 +268,22 @@ fn replay(args: &Args) -> Result<(), String> {
         group(tally.modified)
     );
     println!("traded volume   {} lots", group(tally.volume));
+    if tally.calls > 0 {
+        println!(
+            "auctions        {} call phases, {} uncrosses that traded, {} auction trades for {} lots",
+            group(tally.calls),
+            group(tally.uncrosses),
+            group(tally.auction_trades),
+            group(tally.auction_volume)
+        );
+    }
     println!(
         "resting orders  {} ({} bid levels, {} ask levels)",
         group(engine.len() as u64),
-        engine.level_count(crossbook::Side::Buy),
-        engine.level_count(crossbook::Side::Sell)
+        engine.level_count(Side::Buy),
+        engine.level_count(Side::Sell)
     );
+    println!("phase           {}", engine.phase());
     print_depth(&engine, args.depth);
     println!("event digest    {:016x}", fingerprint.value());
     println!("state hash      {:016x}", engine.state_hash());
@@ -284,6 +326,7 @@ fn verify(args: &Args) -> Result<(), String> {
     let mut fast = Engine::new();
     let mut reference = ReferenceEngine::new();
     let (mut fast_events, mut reference_events) = (Vec::new(), Vec::new());
+    let mut uncrosses = 0;
     let started = Instant::now();
     for (index, command) in commands.iter().enumerate() {
         fast_events.clear();
@@ -295,16 +338,29 @@ fn verify(args: &Args) -> Result<(), String> {
                 "engines diverged at command {index} ({command:?}):\n  fast:      {fast_events:?}\n  reference: {reference_events:?}"
             ));
         }
-        if index.is_multiple_of(1024) || index + 1 == commands.len() {
+        let uncross = matches!(command, Command::Uncross | Command::Resume);
+        if uncross || index.is_multiple_of(1024) || index + 1 == commands.len() {
             fast.check_invariants()
                 .map_err(|error| format!("invariant broken at command {index}: {error}"))?;
             if fast.snapshot() != reference.snapshot() {
                 return Err(format!("books diverged at command {index}"));
             }
+            if fast.indicative_uncross() != reference.indicative_uncross() {
+                return Err(format!("indicative uncross diverged at command {index}"));
+            }
         }
+        uncrosses += fast_events
+            .iter()
+            .filter(|event| matches!(event, Event::Uncrossed { volume, .. } if *volume > 0))
+            .count();
     }
+    let auctions = if args.auctions {
+        format!(", {uncrosses} uncrosses that traded")
+    } else {
+        String::new()
+    };
     println!(
-        "ok: fast engine and reference model agree on {} commands (seed {}), final book {} orders, state hash {:016x} [{:.1} s]",
+        "ok: fast engine and reference model agree on {} commands (seed {}{auctions}), final book {} orders, state hash {:016x} [{:.1} s]",
         group(commands.len() as u64),
         args.seed,
         group(fast.len() as u64),
@@ -440,6 +496,7 @@ fn take_snapshot(args: &Args) -> Result<(), String> {
         group(applied),
         group(bytes.len() as u64)
     );
+    println!("phase           {}", engine.phase());
     println!("state hash      {:016x}", engine.state_hash());
     Ok(())
 }
@@ -487,6 +544,7 @@ fn recover(args: &Args) -> Result<(), String> {
         );
     }
     println!("resting orders  {}", group(recovered.engine.len() as u64));
+    println!("phase           {}", recovered.engine.phase());
     println!("tail digest     {:016x}", fingerprint.value());
     println!("state hash      {:016x}", recovered.engine.state_hash());
     println!("recovery time   {:.3} s", elapsed.as_secs_f64());
@@ -499,7 +557,7 @@ fn feed(args: &Args) -> Result<(), String> {
     let mut publisher = Publisher::new();
     let mut builder = BookBuilder::new();
     let (mut events, mut messages) = (Vec::new(), Vec::new());
-    let (mut prints, mut levels) = (0u64, 0u64);
+    let (mut prints, mut levels, mut auctions) = (0u64, 0u64, 0u64);
     let mut fingerprint = digest::Fingerprint::new();
     let mut busy = Duration::ZERO;
     for (index, command) in commands.iter().enumerate() {
@@ -543,10 +601,24 @@ fn feed(args: &Args) -> Result<(), String> {
                     fingerprint.u64(qty);
                     fingerprint.u32(orders);
                 }
+                Message::Status {
+                    phase, reference, ..
+                } => {
+                    fingerprint.u8(2);
+                    fingerprint.u8(u8::from(phase == crossbook::Phase::Call));
+                    fingerprint.i64(reference.unwrap_or(0));
+                }
+                Message::Auction { result, .. } => {
+                    auctions += 1;
+                    fingerprint.u8(3);
+                    fingerprint.event(&result.event());
+                }
             }
         }
-        if (index.is_multiple_of(1024) || index + 1 == commands.len())
-            && builder.depth(usize::MAX) != engine.depth(usize::MAX)
+        let uncross = matches!(command, Command::Uncross | Command::Resume);
+        if (uncross || index.is_multiple_of(1024) || index + 1 == commands.len())
+            && (builder.depth(usize::MAX) != engine.depth(usize::MAX)
+                || builder.phase() != engine.phase())
         {
             return Err(format!(
                 "the rebuilt book diverged from the engine at command {index}"
@@ -564,6 +636,9 @@ fn feed(args: &Args) -> Result<(), String> {
         group(levels),
         (prints + levels) as f64 / commands.len().max(1) as f64
     );
+    if auctions > 0 {
+        println!("auctions        {} auction results", group(auctions));
+    }
     println!("feed digest     {:016x}", fingerprint.value());
     println!(
         "feed time       {:.3} s to publish and apply ({} messages/s)",
@@ -587,10 +662,11 @@ fn run_exchange(args: &Args) -> Result<(), String> {
     let book = args.book.unwrap_or(2_000);
     let mut flows: Vec<Flow> = (0..args.symbols)
         .map(|symbol| {
-            Flow::new(FlowConfig {
-                target_orders: book,
-                ..FlowConfig::seeded(args.seed.wrapping_add(u64::from(symbol)))
-            })
+            Flow::new(flow_config(
+                args,
+                args.seed.wrapping_add(u64::from(symbol)),
+                book,
+            ))
         })
         .collect();
     let mut pick = SplitMix64::new(args.seed ^ 0x9e37_79b9_7f4a_7c15);
@@ -605,12 +681,13 @@ fn run_exchange(args: &Args) -> Result<(), String> {
         .collect();
     let threads = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
     println!(
-        "{} commands across {} instruments of about {} resting orders (seed {}), batches of {}, \
+        "{} commands across {} instruments of about {} resting orders (seed {}{}), batches of {}, \
          median of {} runs, {threads} hardware threads",
         group(commands.len() as u64),
         args.symbols,
         group(book as u64),
         args.seed,
+        if args.auctions { ", with auctions" } else { "" },
         args.batch,
         args.runs
     );
@@ -819,6 +896,73 @@ fn demo() {
         engine.process(&command, &mut events);
         for event in &events {
             println!("  {event}");
+        }
+    }
+    println!();
+    print_depth(&engine, 3);
+}
+
+fn auction_demo() {
+    use crossbook::{NewOrder, TimeInForce};
+    let market = |id, side, qty| NewOrder::market(id, side, qty).tif(TimeInForce::Gtc);
+    let steps: [(&str, Command); 11] = [
+        (
+            "The opening call starts, with yesterday's close of 100 as the reference price",
+            Command::StartCall {
+                reference: Some(100),
+            },
+        ),
+        (
+            "Orders collect without trading, even when they cross. After each one, the indicative uncross:",
+            Command::New(NewOrder::limit(1, Side::Sell, 99, 6)),
+        ),
+        ("", Command::New(NewOrder::limit(2, Side::Sell, 100, 4))),
+        (
+            "A buy for 5 @ 102 crosses: at 99 only 1 lot is left over, the lowest surplus",
+            Command::New(NewOrder::limit(3, Side::Buy, 102, 5)),
+        ),
+        (
+            "8 lots can trade at 100 or 101, both with 2 lots left to sell: with sellers in excess, the lower price",
+            Command::New(NewOrder::limit(4, Side::Buy, 101, 3)),
+        ),
+        (
+            "A market buy for 2 waits for the uncross. 100 and 101 now both trade 10 lots with no surplus, so the one nearer the reference price",
+            Command::New(market(5, Side::Buy, 2)),
+        ),
+        ("", Command::New(NewOrder::limit(6, Side::Sell, 101, 3))),
+        (
+            "Immediate-or-cancel needs continuous trading, so the call phase rejects it",
+            Command::New(NewOrder::limit(7, Side::Buy, 102, 5).tif(TimeInForce::Ioc)),
+        ),
+        (
+            "Now 13 lots can trade at 101, more than at any other price",
+            Command::New(NewOrder::limit(8, Side::Buy, 101, 4)),
+        ),
+        (
+            "The uncross: every crossing order trades at 101, market orders first, then better prices, then earlier orders",
+            Command::Uncross,
+        ),
+        (
+            "Continuous trading resumes from an uncrossed book",
+            Command::Resume,
+        ),
+    ];
+    let mut engine = Engine::new();
+    let mut events = Vec::new();
+    for (index, (note, command)) in steps.into_iter().enumerate() {
+        if !note.is_empty() {
+            if index > 0 {
+                println!();
+            }
+            println!("# {note}");
+        }
+        events.clear();
+        engine.process(&command, &mut events);
+        for event in &events {
+            println!("  {event}");
+        }
+        if engine.phase() == crossbook::Phase::Call && matches!(command, Command::New(_)) {
+            println!("  indicative uncross: {}", engine.indicative_uncross());
         }
     }
     println!();

@@ -65,6 +65,27 @@ export const scenarios = [
       'Ana’s buy would first hit her own ask at 100. Cancel-oldest removes that resting ask, then the buy trades 5 lots with Ben at 101 and rests the other 3. In the follow-up, Ana’s sell would hit her own resting bid. Cancel-newest cancels the incoming sell and leaves her bid in place.',
   },
   {
+    id: 'auction',
+    title: 'Opening auction',
+    rule: 'In a call phase orders rest without trading. The uncross picks one price: the most volume, then the smallest surplus, then market pressure, then the reference price.',
+    setup: [
+      { op: 'startCall', reference: 100 },
+      sell(99, 6, 1),
+      sell(100, 4, 1),
+      buy(102, 5, 2),
+      buy(101, 3, 3),
+      { op: 'submit', side: 'buy', kind: 'market', qty: 2, tif: 'gtc', account: 2 },
+      sell(101, 3, 1),
+      buy(101, 4, 3),
+    ],
+    action: { op: 'uncross' },
+    actionLabel: 'Uncross the auction',
+    followUp: { op: 'resume' },
+    followUpLabel: 'Resume continuous trading',
+    explain:
+      'The bids and asks cross, but nothing traded while they arrived. At 101, 13 lots can change hands, more than at any other price, so everyone trades at 101: Ben’s market order first, then his bid at 102, then Cleo’s bids at 101 in time order. Ana’s sell at 99 also gets 101. One lot of #7 is left over, the surplus, and rests on the book. Resuming continuous trading starts from that uncrossed book.',
+  },
+  {
     id: 'modify',
     title: 'Modify and queue priority',
     rule: 'Reducing quantity at the same price keeps your place. Any other change sends you to the back.',

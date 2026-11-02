@@ -11,10 +11,13 @@ const LOG_LIMIT = 50; // command groups kept in the event log
 const INPUT_MAX = 999_999; // keeps ticket numbers to sane integers
 const SEED_MAX = 4_294_967_295; // the engine takes a u32 seed
 
-// Digests pinned by the native Rust tests (x86-64), keyed by `${seed}:${commands}`.
+// Digests of the native Rust build (x86-64), keyed by `${session}:${seed}:${commands}`.
+// CI checks that they are current (scripts/check-determinism.sh).
 const NATIVE = new Map([
-  ['42:100000', { eventDigest: '3749b835b0ff0cae', stateHash: 'ee0bfb94bbfc39a7' }],
-  ['42:1000000', { eventDigest: 'f872e8139008e21f', stateHash: 'cd43f17fdee94c04' }],
+  ['continuous:42:100000', { eventDigest: '3749b835b0ff0cae', stateHash: 'ee0bfb94bbfc39a7' }],
+  ['continuous:42:1000000', { eventDigest: 'f872e8139008e21f', stateHash: 'cd43f17fdee94c04' }],
+  ['auctions:42:100000', { eventDigest: 'a5bb1e7ca4448d51', stateHash: 'd0a536b7a64fb055' }],
+  ['auctions:42:1000000', { eventDigest: 'e51f304f84984e6e', stateHash: '805a6d40078c9151' }],
 ]);
 
 const TIF_NAME = { gtc: 'GTC', ioc: 'IOC', fok: 'FOK' };
@@ -45,6 +48,11 @@ const ui = {
   spread: byId('spread'),
   bookStatus: byId('book-status'),
   clearBook: byId('clear-book'),
+  phaseBar: byId('phase-bar'),
+  phaseLabel: byId('phase-label'),
+  startCall: byId('start-call'),
+  uncross: byId('uncross-btn'),
+  resume: byId('resume-btn'),
 
   selEmpty: byId('selection-empty'),
   selBody: byId('selection-body'),
@@ -77,6 +85,7 @@ const ui = {
   seed: byId('seed'),
   stressOut: byId('stress-out'),
   stressCount: document.querySelector('[data-field="count"]'),
+  stressSession: document.querySelector('[data-field="session"]'),
 
   announcer: byId('announcer'),
 };
@@ -92,6 +101,7 @@ const state = {
   lastTrade: null,
   scenario: null, // { def, step: 0 | 1 | 2, dirty, setup }
   stressCount: 100_000,
+  stressSession: 'continuous',
   stressRunning: false,
 };
 
@@ -196,6 +206,9 @@ function nextPaint() {
 // ---------------------------------------------------------------------------------------
 // Engine calls
 
+// Phase commands carry no order; `startCall` may carry a reference price.
+const PHASE_OPS = new Set(['startCall', 'uncross', 'resume']);
+
 function normalize(command) {
   if (command.op !== 'submit') return { ...command };
   const kind = command.kind ?? 'limit';
@@ -232,13 +245,19 @@ function run(command) {
   } else if (command.op === 'cancel') {
     id = command.id;
     json = engine.cancel(id);
-  } else {
+  } else if (command.op === 'modify') {
     id = command.id;
     json = engine.modify(id, command.price, command.qty);
+  } else if (command.op === 'startCall') {
+    json = engine.startCall(command.reference ?? undefined);
+  } else if (command.op === 'uncross') {
+    json = engine.uncross();
+  } else {
+    json = engine.resume();
   }
   const events = JSON.parse(json);
   for (const event of events) {
-    if (event.type === 'trade') state.lastTrade = { price: event.price, qty: event.qty };
+    if (event.type === 'trade' || event.type === 'auction-trade') state.lastTrade = { price: event.price, qty: event.qty };
   }
   return { command, id, events };
 }
@@ -259,7 +278,10 @@ function touchedIds(events) {
     if (event.type === 'trade') {
       ids.add(event.maker);
       ids.add(event.taker);
-    } else if (event.type === 'booked' || event.type === 'modified') {
+    } else if (event.type === 'auction-trade') {
+      ids.add(event.buy);
+      ids.add(event.sell);
+    } else if (event.type === 'booked' || event.type === 'modified' || event.type === 'market-booked') {
       ids.add(event.id);
     }
   }
@@ -270,6 +292,11 @@ function touchedIds(events) {
 // Plain-English descriptions
 
 function commandParts(command, { short = false } = {}) {
+  if (command.op === 'startCall') {
+    return command.reference ? ['Start the call phase, reference price ', n(command.reference)] : ['Start the call phase'];
+  }
+  if (command.op === 'uncross') return ['Uncross the auction'];
+  if (command.op === 'resume') return ['Resume continuous trading'];
   if (command.op === 'submit') {
     const verb = command.side === 'buy' ? 'buys' : 'sells';
     const what = command.kind === 'market' ? [q(command.qty), ' at market'] : [q(command.qty), ' @ ', n(command.price)];
@@ -306,6 +333,8 @@ function rejectReason(reason, command) {
         : ['it would trade on arrival, and post-only orders only add liquidity.'];
     case 'fill-or-kill-unfillable':
       return ['the book cannot fill all ', ...lots(command.qty), ' right now, so nothing trades.'];
+    case 'needs-continuous-trading':
+      return ['IOC, FOK and post-only orders need continuous trading, and the book is in a call phase. Send a GTC order.'];
     default:
       return [`${reason}.`];
   }
@@ -358,6 +387,12 @@ function eventParts(event, result) {
           ' the book.',
         ];
       }
+      if (event.reason === 'call-phase') {
+        return [ref(event.id), ' is post-only and leaves the book: auction trades take liquidity, so post-only orders cannot join a call.'];
+      }
+      if (event.reason === 'unfilled' && result.command.op !== 'submit') {
+        return [ref(event.id), ' cancels its remaining ', ...lots(event.remaining), ': market orders never rest in continuous trading.'];
+      }
       if (event.reason === 'unfilled') {
         const order = state.orders.get(event.id);
         const buys = order?.side !== 'sell';
@@ -399,6 +434,29 @@ function eventParts(event, result) {
       const after = command.op === 'modify' ? ' The order stays as it was.' : ' The book does not change.';
       return [...subject, ' rejected: ', ...rejectReason(event.reason, command), after];
     }
+    case 'market-booked':
+      return [ref(event.id), ` waits for the uncross: ${event.side} `, ...lots(event.qty), ' at market, ahead of every limit order.'];
+    case 'call-started':
+      return event.reference === null
+        ? ['The call phase starts. Orders now rest without trading. There is no reference price yet.']
+        : ['The call phase starts. Orders now rest without trading. Reference price ', n(event.reference), '.'];
+    case 'auction-trade':
+      return [
+        ref(event.buy),
+        ' buys ',
+        ...lots(event.qty),
+        ' from ',
+        ref(event.sell),
+        ' at the clearing price ',
+        n(event.price),
+        '. ',
+        ...(event.buyRemaining === 0 ? [ref(event.buy), ' is filled; '] : [ref(event.buy), ' keeps ', q(event.buyRemaining), '; ']),
+        ...(event.sellRemaining === 0 ? [ref(event.sell), ' is filled.'] : [ref(event.sell), ' keeps ', q(event.sellRemaining), '.']),
+      ];
+    case 'uncrossed':
+      return [...summaryParts(event.summary, true), '.'];
+    case 'resumed':
+      return ['Continuous trading resumes: new orders match on arrival again.'];
     case 'modified':
       return event.keptPriority
         ? [ref(event.id), ' is now ', ...lots(event.qty), ' @ ', n(event.price), ' and keeps its place in the queue.']
@@ -415,11 +473,22 @@ function eventParts(event, result) {
   }
 }
 
+// The indicative or final uncross: "13 lots at 101, 1 lot left to buy".
+function summaryParts(summary, final) {
+  if (summary.price === null) return [final ? 'The uncross finds nothing that crosses' : 'nothing crosses'];
+  const left = summary.imbalanceSide === null ? ', no surplus' : `, ${plural(summary.imbalance, 'lot')} left to ${summary.imbalanceSide}`;
+  return [final ? 'Uncrossed: ' : '', ...lots(summary.volume), ' at ', n(summary.price), left];
+}
+
 // One line on what a command did, e.g. "2 trades for 8 lots, 3 lots rest at 101".
 function outcome(result) {
   const rejected = result.events.find((event) => event.type === 'rejected');
   if (rejected) return { rejected: true, text: `rejected: ${toText(rejectReason(rejected.reason, result.command))}` };
   const bits = [];
+  const uncrossed = result.events.find((event) => event.type === 'uncrossed');
+  if (uncrossed) bits.push(toText(summaryParts(uncrossed.summary, true)));
+  if (result.events.some((event) => event.type === 'call-started')) bits.push('the call phase starts');
+  if (result.events.some((event) => event.type === 'resumed')) bits.push('continuous trading resumes');
   const trades = result.events.filter((event) => event.type === 'trade');
   if (trades.length) {
     const filled = trades.reduce((sum, event) => sum + event.qty, 0);
@@ -428,8 +497,10 @@ function outcome(result) {
   for (const event of result.events) {
     if (event.type === 'booked')
       bits.push(`${plural(event.qty, 'lot')} ${event.qty === 1 ? 'rests' : 'rest'} at ${event.price}`);
+    if (event.type === 'market-booked') bits.push(`${plural(event.qty, 'lot')} wait at market for the uncross`);
+    if (event.type === 'canceled' && event.reason === 'call-phase') bits.push(`post-only #${event.id} leaves the book`);
     if (event.type === 'canceled' && event.reason === 'unfilled')
-      bits.push(`${plural(event.remaining, 'lot')} canceled unfilled`);
+      bits.push(`${plural(event.remaining, 'lot')} of #${event.id} canceled unfilled`);
     if (event.type === 'canceled' && event.reason === 'self-trade')
       bits.push(`self-trade prevention cancels #${event.id}`);
     if (event.type === 'canceled' && event.reason === 'requested') bits.push(`#${event.id} canceled`);
@@ -456,6 +527,11 @@ const TAG = {
   canceled: 'Canceled',
   rejected: 'Rejected',
   modified: 'Modified',
+  'market-booked': 'Booked',
+  'call-started': 'Call',
+  'auction-trade': 'Auction',
+  uncrossed: 'Uncross',
+  resumed: 'Resumed',
 };
 
 function eventList(result) {
@@ -463,7 +539,9 @@ function eventList(result) {
     'ol',
     { class: 'events' },
     result.events.map((event) => {
-      const side = event.type === 'booked' ? (event.side === 'buy' ? ' is-bid' : ' is-ask') : '';
+      const sideClass = event.side === 'buy' ? ' is-bid' : ' is-ask';
+      const side =
+        event.type === 'booked' ? sideClass : event.type === 'market-booked' ? ` tag-booked${sideClass}` : '';
       return h(
         'li',
         { class: 'event', 'data-type': event.type },
@@ -485,10 +563,12 @@ function pushGroup(group) {
 
 function logCommand(result) {
   const meta = result.command.op === 'submit' ? h('span', { class: 'group-meta num' }, `#${result.id}`) : null;
+  // Phase commands are the venue's, not a participant's: mark them in the log.
+  const kind = PHASE_OPS.has(result.command.op) ? 'phase' : 'command';
   pushGroup(
     h(
       'li',
-      { class: 'group', 'data-kind': 'command' },
+      { class: 'group', 'data-kind': kind },
       h('div', { class: 'group-head' }, h('p', { class: 'group-title' }, toNodes(commandParts(result.command))), meta),
       eventList(result),
     ),
@@ -504,7 +584,7 @@ function logSetup(title, results) {
         'div',
         { class: 'group-head' },
         h('p', { class: 'group-title' }, `Setup: ${title}`),
-        h('span', { class: 'group-meta' }, plural(results.length, 'order')),
+        h('span', { class: 'group-meta' }, plural(results.filter((result) => result.command.op === 'submit').length, 'order')),
       ),
       h('p', { class: 'group-note' }, 'Book reset. Ids restart at 1.'),
       results.map((result) =>
@@ -589,12 +669,43 @@ function levelNode(side, level, maxQty, { flash, touched }) {
   );
 }
 
+// Market orders waiting for an uncross: one row next to the spread band, outside the levels.
+function marketRow(side, orders, maxQty, touched) {
+  const qty = orders.reduce((sum, order) => sum + order.qty, 0);
+  const bar = h('span', { class: 'level-bar' });
+  bar.style.setProperty('--w', Math.min(1, qty / maxQty).toFixed(4));
+  return h(
+    'li',
+    { class: `level is-market ${side === 'buy' ? 'is-bid' : 'is-ask'}` },
+    h(
+      'span',
+      {
+        class: 'level-btn is-static',
+        'aria-label': `${side === 'buy' ? 'Market buys' : 'Market sells'} waiting for the uncross, ${plural(qty, 'lot')}`,
+      },
+      h('span', { class: 'side-tag' }, side === 'buy' ? 'Bid' : 'Ask'),
+      h('span', { class: 'level-price' }, 'MKT'),
+      h('span', { class: 'level-qty' }, bar, h('span', { class: 'num' }, fmt.format(qty))),
+    ),
+    h(
+      'div',
+      { class: 'queue' },
+      orders.map((order, index) => chipNode(order, index, orders.length, touched)),
+    ),
+  );
+}
+
 // One side of the ladder, padded with empty slots to LEVELS rows so the spread band stays
 // in place on wide screens (the slots are hidden on narrow ones). Asks list the best price
-// last, next to the band; bids list it first.
-function sideRows(side, levels, maxQty, options) {
+// last, next to the band; bids list it first. Waiting market orders sit next to the band.
+function sideRows(side, levels, maxQty, options, market = []) {
   const ordered = side === 'sell' ? [...levels].reverse() : levels;
   const rows = ordered.map((level) => levelNode(side, level, maxQty, options));
+  if (market.length) {
+    const row = marketRow(side, market, maxQty, options.touched);
+    if (side === 'sell') rows.push(row);
+    else rows.unshift(row);
+  }
   const filled = rows.length ? rows : [h('li', { class: 'side-empty' }, side === 'buy' ? 'No bids' : 'No asks')];
   const pad = Array.from({ length: Math.max(0, LEVELS - filled.length) }, () =>
     h('li', { class: 'slot', 'aria-hidden': 'true' }),
@@ -613,8 +724,9 @@ function renderBook({ touched = new Set(), flash = false, traded = false } = {})
   const maxQty = Math.max(1, ...levels.map((level) => level.qty));
   const options = { flash, touched };
 
-  fill(ui.asks, sideRows('sell', book.asks, maxQty, options));
-  fill(ui.bids, sideRows('buy', book.bids, maxQty, options));
+  fill(ui.asks, sideRows('sell', book.asks, maxQty, options, book.marketAsks));
+  fill(ui.bids, sideRows('buy', book.bids, maxQty, options, book.marketBids));
+  renderPhase(book);
 
   state.levelQty = new Map([
     ...book.asks.map((level) => [`sell:${level.price}`, level.qty]),
@@ -631,11 +743,30 @@ function renderBook({ touched = new Set(), flash = false, traded = false } = {})
   }
 }
 
+function renderPhase(book) {
+  const call = book.phase === 'call';
+  ui.phaseBar.dataset.phase = book.phase;
+  ui.phaseLabel.textContent = call
+    ? `Call phase${book.referencePrice === null ? '' : `, reference price ${book.referencePrice}`}`
+    : 'Continuous trading';
+  ui.startCall.hidden = call;
+  ui.uncross.hidden = !call;
+  ui.resume.hidden = !call;
+}
+
 function renderSpread(book, traded) {
   const bestBid = book.bids[0];
   const bestAsk = book.asks[0];
   let main;
-  if (!bestBid && !bestAsk) {
+  if (book.phase === 'call') {
+    // During a call the band shows what an uncross would do now, as exchanges publish it.
+    main = h(
+      'span',
+      { class: 'spread-item', id: 'indicative' },
+      h('span', { class: 'spread-label' }, 'Indicative uncross'),
+      h('span', {}, toNodes(summaryParts(book.indicative, false))),
+    );
+  } else if (!bestBid && !bestAsk) {
     main = h('span', { class: 'spread-item spread-muted' }, 'Empty book');
   } else {
     main = h(
@@ -690,6 +821,13 @@ function renderBookStatus(book) {
 
 function findOrder(id) {
   if (!state.book) return null;
+  for (const [side, queue] of [
+    ['sell', state.book.marketAsks],
+    ['buy', state.book.marketBids],
+  ]) {
+    const index = queue.findIndex((order) => order.id === id);
+    if (index >= 0) return { ...queue[index], side, price: null, position: index + 1, queueLength: queue.length };
+  }
   for (const [side, levels] of [
     ['sell', state.book.asks],
     ['buy', state.book.bids],
@@ -725,6 +863,8 @@ function leftTheBook(id, events) {
   return events.some(
     (event) =>
       (event.type === 'canceled' && event.id === id) ||
+      (event.type === 'auction-trade' && event.buy === id && event.buyRemaining === 0) ||
+      (event.type === 'auction-trade' && event.sell === id && event.sellRemaining === 0) ||
       (event.type === 'trade' && event.maker === id && event.makerRemaining === 0) ||
       (event.type === 'trade' && event.taker === id && event.takerRemaining === 0),
   );
@@ -762,14 +902,13 @@ function renderSelection({ moveFocus = false, events = [] } = {}) {
       h('span', { class: order.side === 'buy' ? 'is-bid-text' : 'is-ask-text' }, sideWord),
       ' ',
       h('span', { class: 'num' }, fmt.format(order.qty)),
-      ' @ ',
-      h('span', { class: 'num' }, order.price),
+      order.price === null ? ' at market' : [' @ ', h('span', { class: 'num' }, order.price)],
       ` · ${ordinal(order.position)} of ${order.queueLength} in the queue`,
       order.postOnly ? ' · post-only' : '',
     ),
   );
   if (state.modifyFor !== order.id) {
-    ui.modPrice.value = order.price;
+    ui.modPrice.value = order.price ?? state.book.referencePrice ?? 100;
     ui.modQty.value = order.qty;
     state.modifyFor = order.id;
   }
@@ -788,6 +927,7 @@ function select(id) {
 
 function execute(command, { fromScenario = false } = {}) {
   const result = run(command);
+  const phaseChanged = PHASE_OPS.has(command.op);
   if (!fromScenario && state.scenario) state.scenario.dirty = true;
   if (command.op === 'modify' && command.id === state.selected) state.modifyFor = null;
   logCommand(result);
@@ -798,6 +938,7 @@ function execute(command, { fromScenario = false } = {}) {
   });
   renderSelection({ events: result.events });
   renderScenario();
+  if (phaseChanged) renderTicket();
   announce(summaryText(result));
   return result;
 }
@@ -822,6 +963,11 @@ function ticketOrder() {
 
 function ticketHint(order) {
   const buys = order.side === 'buy';
+  if (state.book?.phase === 'call') {
+    if (order.tif !== 'gtc' || order.postOnly) return 'Call phase: IOC, FOK and post-only orders are rejected. Choose GTC.';
+    if (order.kind === 'market') return 'Call phase: waits at market for the uncross. What does not fill is canceled.';
+    return `Call phase: rests at ${order.price} without trading, even if it crosses. The uncross sets one price.`;
+  }
   const verb = buys ? 'Buys' : 'Sells';
   const qty = fmt.format(order.qty);
   if (order.kind === 'market') {
@@ -927,7 +1073,7 @@ ui.ladder.addEventListener('click', (event) => {
     select(Number(chip.dataset.id));
     return;
   }
-  const level = event.target.closest('.level-btn');
+  const level = event.target.closest('.level-btn[data-price]');
   if (level) usePrice(Number(level.dataset.price));
 });
 
@@ -961,6 +1107,10 @@ document.addEventListener('keydown', (event) => {
   renderSelection();
 });
 
+ui.startCall.addEventListener('click', () => execute({ op: 'startCall' }));
+ui.uncross.addEventListener('click', () => execute({ op: 'uncross' }));
+ui.resume.addEventListener('click', () => execute({ op: 'resume' }));
+
 ui.clearBook.addEventListener('click', () => {
   resetEngine();
   state.scenario = null;
@@ -968,6 +1118,7 @@ ui.clearBook.addEventListener('click', () => {
   renderBook();
   renderSelection();
   renderScenario();
+  renderTicket();
   announce('Book cleared. Ids restart at 1.');
 });
 
@@ -1023,7 +1174,7 @@ function renderScenario() {
       h(
         'li',
         {},
-        h('span', { class: 'num sc-id' }, `#${result.id}`),
+        result.id === undefined ? h('span', { class: 'sc-id' }) : h('span', { class: 'num sc-id' }, `#${result.id}`),
         toNodes(commandParts(result.command, { short: true })),
       ),
     ),
@@ -1047,6 +1198,7 @@ function loadScenario(def, { quiet = false } = {}) {
   renderBook();
   renderSelection();
   renderScenario();
+  renderTicket();
   if (!quiet) announce(`${def.title} loaded with ${plural(setup.length, 'starting order')}. ${def.rule}`);
 }
 
@@ -1122,11 +1274,11 @@ function digestBlock(label, value, expected) {
   return h('div', { class: 'digest' }, h('p', { class: 'digest-label' }, label), rows);
 }
 
-function renderStressResult({ count, seed, generationMs, engineMs, summary }) {
+function renderStressResult({ count, seed, session, generationMs, engineMs, summary }) {
   const perSecond = summary.commands / (Math.max(engineMs, 0.001) / 1000);
   const rate = formatRate(perSecond);
   const nsPerCommand = (engineMs * 1e6) / summary.commands;
-  const reference = NATIVE.get(`${seed}:${count}`);
+  const reference = NATIVE.get(`${session}:${seed}:${count}`);
   const matches =
     reference && reference.eventDigest === summary.eventDigest && reference.stateHash === summary.stateHash;
 
@@ -1142,13 +1294,13 @@ function renderStressResult({ count, seed, generationMs, engineMs, summary }) {
     verdict = h(
       'p',
       { class: 'verdict is-mismatch', id: 'stress-verdict', 'data-match': 'false' },
-      `Does not match the native reference for seed ${seed} with ${fmt.format(count)} commands.`,
+      `Does not match the native reference for seed ${seed} with ${fmt.format(count)} commands${session === 'auctions' ? ' with auctions' : ''}.`,
     );
   } else {
     verdict = h(
       'p',
       { class: 'verdict is-none', id: 'stress-verdict' },
-      `No native reference is pinned for seed ${seed} with ${fmt.format(count)} commands. Seed 42 with 100,000 or 1,000,000 has one.`,
+      `No native reference is listed for seed ${seed} with ${fmt.format(count)} commands. Seed 42 with 100,000 or 1,000,000 has one.`,
     );
   }
 
@@ -1214,7 +1366,7 @@ function metric(label, value) {
 
 // Runs one stress test in a fresh module worker, so the page stays responsive and the
 // staged commands are released when the worker ends.
-function stressInWorker(count, seed, onMatch) {
+function stressInWorker(count, seed, session, onMatch) {
   return new Promise((resolve, reject) => {
     let worker;
     try {
@@ -1237,15 +1389,16 @@ function stressInWorker(count, seed, onMatch) {
       worker.terminate();
       reject(new Error(event.message || 'the worker failed'));
     };
-    worker.postMessage({ count, seed });
+    worker.postMessage({ count, seed, auctions: session === 'auctions' });
   });
 }
 
-async function stressOnMainThread(count, seed, onMatch) {
+async function stressOnMainThread(count, seed, session, onMatch) {
   const playground = new Playground();
   try {
     const g0 = performance.now();
-    playground.stage(count, seed);
+    if (session === 'auctions') playground.stageSession(count, seed);
+    else playground.stage(count, seed);
     const generationMs = performance.now() - g0;
     onMatch();
     await nextPaint();
@@ -1260,6 +1413,7 @@ async function stressOnMainThread(count, seed, onMatch) {
 async function runStress() {
   if (state.stressRunning || !state.engine) return;
   const count = state.stressCount;
+  const session = state.stressSession;
   const seed = readInt(ui.seed, SEED_MAX);
   ui.seed.value = seed;
 
@@ -1274,12 +1428,12 @@ async function runStress() {
 
   try {
     const onMatch = () => stressStatus(`Matching ${fmt.format(count)} commands…`);
-    const result = await stressInWorker(count, seed, onMatch).catch((error) => {
+    const result = await stressInWorker(count, seed, session, onMatch).catch((error) => {
       // Browsers without module workers fall back to running on the main thread.
-      if (error?.name === 'WorkerUnavailable') return stressOnMainThread(count, seed, onMatch);
+      if (error?.name === 'WorkerUnavailable') return stressOnMainThread(count, seed, session, onMatch);
       throw error;
     });
-    renderStressResult({ count, seed, ...result });
+    renderStressResult({ count, seed, session, ...result });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     fill(
@@ -1302,6 +1456,15 @@ ui.stressCount.addEventListener('click', (event) => {
   if (!button) return;
   state.stressCount = Number(button.dataset.value);
   for (const option of ui.stressCount.querySelectorAll('button')) {
+    option.setAttribute('aria-pressed', option === button ? 'true' : 'false');
+  }
+});
+
+ui.stressSession.addEventListener('click', (event) => {
+  const button = event.target.closest('button[data-value]');
+  if (!button) return;
+  state.stressSession = button.dataset.value;
+  for (const option of ui.stressSession.querySelectorAll('button')) {
     option.setAttribute('aria-pressed', option === button ? 'true' : 'false');
   }
 });
@@ -1339,6 +1502,7 @@ async function start() {
   loadScenario(scenarios[0], { quiet: true });
   ui.submit.disabled = false;
   ui.clearBook.disabled = false;
+  ui.startCall.disabled = false;
   ui.stressRun.disabled = false;
   document.documentElement.dataset.engine = 'ready';
 }

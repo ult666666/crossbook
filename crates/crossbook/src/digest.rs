@@ -8,6 +8,9 @@
 
 use crate::types::{CancelReason, Event, OrderView, Price, RejectReason, Side, StpMode};
 
+// Event codes 1 to 6 are the continuous-trading events; 7 to 11 came with call auctions.
+// Existing codes never change, so digests of sessions without auctions stay the same.
+
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
@@ -134,6 +137,45 @@ impl Fingerprint {
                 self.u64(qty);
                 self.u8(u8::from(kept_priority));
             }
+            Event::MarketBooked { id, side, qty } => {
+                self.u8(7);
+                self.u64(id);
+                self.u8(side_code(side));
+                self.u64(qty);
+            }
+            Event::CallStarted { reference } => {
+                self.u8(8);
+                self.optional_price(reference);
+            }
+            Event::AuctionTrade {
+                buy,
+                sell,
+                price,
+                qty,
+                buy_remaining,
+                sell_remaining,
+            } => {
+                self.u8(9);
+                self.u64(buy);
+                self.u64(sell);
+                self.i64(price);
+                self.u64(qty);
+                self.u64(buy_remaining);
+                self.u64(sell_remaining);
+            }
+            Event::Uncrossed {
+                price,
+                volume,
+                imbalance_side,
+                imbalance,
+            } => {
+                self.u8(10);
+                self.optional_price(price);
+                self.u64(volume);
+                self.u8(imbalance_side.map_or(0, |side| 1 + side_code(side)));
+                self.u64(imbalance);
+            }
+            Event::Resumed => self.u8(11),
         }
     }
 
@@ -187,6 +229,7 @@ const fn reject_code(reason: RejectReason) -> u8 {
         RejectReason::UnknownOrder => 6,
         RejectReason::PostOnlyWouldCross => 7,
         RejectReason::FillOrKillUnfillable => 8,
+        RejectReason::NeedsContinuousTrading => 9,
     }
 }
 
@@ -195,6 +238,7 @@ const fn cancel_code(reason: CancelReason) -> u8 {
         CancelReason::Requested => 1,
         CancelReason::Unfilled => 2,
         CancelReason::SelfTrade => 3,
+        CancelReason::CallPhase => 4,
     }
 }
 

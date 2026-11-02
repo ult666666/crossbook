@@ -51,6 +51,9 @@ fn command() -> impl Strategy<Value = Command> {
             price,
             qty
         }),
+        any::<Option<i64>>().prop_map(|reference| Command::StartCall { reference }),
+        Just(Command::Uncross),
+        Just(Command::Resume),
     ]
 }
 
@@ -74,7 +77,7 @@ proptest! {
     }
 
     #[test]
-    fn plausible_frames_decode_canonically(kind in 1u8..=3, mut body in prop::collection::vec(prop_oneof![9 => Just(0u8), 1 => any::<u8>()], 39)) {
+    fn plausible_frames_decode_canonically(kind in 1u8..=7, mut body in prop::collection::vec(prop_oneof![9 => Just(0u8), 1 => any::<u8>()], 39)) {
         // Mostly-zero bodies reach the field checks far more often than uniform bytes do.
         body.insert(0, kind);
         if let Ok((command, len)) = decode(&body) {

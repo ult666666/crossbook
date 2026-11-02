@@ -7,6 +7,11 @@
 //!   into its level's FIFO queue by `u32` indices, so cancel is O(1) after the lookup;
 //! - an `OrderId -> slot` hash map for cancel and modify.
 //!
+//! During an auction call phase the same structures hold the call book, which may cross,
+//! plus one FIFO queue of market orders per side. Market nodes carry price 0, which no
+//! limit order can have. The uncross ([`crate::auction`]) reads the cached level totals to
+//! find the clearing price, then fills each side's orders in priority order.
+//!
 //! The engine is single threaded and deterministic: it never reads clocks, randomness or
 //! hash-map iteration order, so the same commands always produce the same events.
 
@@ -14,10 +19,12 @@ use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{BuildHasherDefault, Hasher};
 
+use crate::auction;
 use crate::digest::Fingerprint;
 use crate::types::{
-    AccountId, CancelReason, Command, Depth, Event, LevelView, MAX_QTY, NewOrder, OrderId,
-    OrderView, Price, Qty, RejectReason, Side, StpMode, TimeInForce, crosses, static_reject,
+    AccountId, CancelReason, Command, Depth, Event, LevelView, MARKET, MAX_QTY, NewOrder, OrderId,
+    OrderView, Phase, Price, Qty, RejectReason, Side, StpMode, TimeInForce, UncrossSummary,
+    crosses, static_reject,
 };
 
 const NIL: u32 = u32::MAX;
@@ -51,6 +58,12 @@ impl Level {
         total: 0,
         count: 0,
     };
+}
+
+impl Default for Level {
+    fn default() -> Self {
+        Self::EMPTY
+    }
 }
 
 /// Multiplicative hasher for integer order ids (FxHash with a final fold).
@@ -123,10 +136,26 @@ struct Taker {
 pub struct Engine {
     bids: BTreeMap<Price, Level>,
     asks: BTreeMap<Price, Level>,
+    /// Market orders waiting for an uncross, in time priority. Empty in continuous trading.
+    market_bids: Level,
+    market_asks: Level,
     nodes: Vec<Node>,
     free: Vec<u32>,
     index: IdMap,
     clock: u64,
+    phase: Phase,
+    /// Reference price of the current call phase.
+    reference: Option<Price>,
+    last_trade: Option<Price>,
+}
+
+/// Engine state besides the resting orders, as a snapshot stores it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SessionState {
+    pub clock: u64,
+    pub phase: Phase,
+    pub reference: Option<Price>,
+    pub last_trade: Option<Price>,
 }
 
 impl Engine {
@@ -154,11 +183,16 @@ impl Engine {
             Command::New(ref order) => self.submit(order, out),
             Command::Cancel { id } => self.cancel(id, out),
             Command::Modify { id, price, qty } => self.modify(id, price, qty, out),
+            Command::StartCall { reference } => self.start_call(reference, out),
+            Command::Uncross => self.uncross(out),
+            Command::Resume => self.resume(out),
         }
     }
 
     fn submit(&mut self, order: &NewOrder, out: &mut Vec<Event>) {
-        let reject = static_reject(order)
+        // In a call phase `static_reject` has already turned away post-only, IOC and FOK
+        // orders, so the book-state checks below cannot fire there.
+        let reject = static_reject(order, self.phase)
             .or_else(|| {
                 self.index
                     .contains_key(&order.id)
@@ -186,6 +220,25 @@ impl Engine {
             price: order.kind.limit(),
             qty: order.qty,
         });
+        if self.phase == Phase::Call {
+            // Nothing trades on arrival in a call phase; a market order waits unpriced.
+            self.rest(
+                Node {
+                    id: order.id,
+                    account: order.account,
+                    side: order.side,
+                    price: order.kind.limit().unwrap_or(MARKET),
+                    remaining: order.qty,
+                    priority: 0,
+                    stp: order.stp,
+                    post_only: false,
+                    prev: NIL,
+                    next: NIL,
+                },
+                out,
+            );
+            return;
+        }
         let taker = Taker {
             id: order.id,
             account: order.account,
@@ -267,6 +320,8 @@ impl Engine {
         }
         let node = self.nodes[slot as usize];
 
+        // A market order waiting for an uncross has price 0, so it always takes the
+        // re-entry path below and becomes a limit order.
         if price == node.price && qty <= node.remaining {
             let level = side_book(&mut self.bids, &mut self.asks, node.side)
                 .get_mut(&price)
@@ -298,6 +353,17 @@ impl Engine {
             qty,
             kept_priority: false,
         });
+        if self.phase == Phase::Call {
+            self.rest(
+                Node {
+                    price,
+                    remaining: qty,
+                    ..node
+                },
+                out,
+            );
+            return;
+        }
         let taker = Taker {
             id,
             account: node.account,
@@ -369,6 +435,7 @@ impl Engine {
             *remaining -= qty;
             level.total -= qty;
             self.nodes[slot as usize].remaining = maker_remaining;
+            self.last_trade = Some(price);
             out.push(Event::Trade {
                 taker: taker.id,
                 maker: maker.id,
@@ -390,7 +457,8 @@ impl Engine {
         false
     }
 
-    /// Adds `node` to the back of its price level with a fresh time priority.
+    /// Adds `node` to the back of its price level, or of its side's market queue, with a
+    /// fresh time priority.
     fn rest(&mut self, mut node: Node, out: &mut Vec<Event>) {
         self.clock += 1;
         node.priority = self.clock;
@@ -409,11 +477,17 @@ impl Engine {
                 slot
             }
         };
+        self.index.insert(id, slot);
+        if price == MARKET {
+            let queue = market_queue(&mut self.market_bids, &mut self.market_asks, side);
+            link_back(queue, &mut self.nodes, slot);
+            out.push(Event::MarketBooked { id, side, qty });
+            return;
+        }
         let level = side_book(&mut self.bids, &mut self.asks, side)
             .entry(price)
             .or_insert(Level::EMPTY);
         link_back(level, &mut self.nodes, slot);
-        self.index.insert(id, slot);
         out.push(Event::Booked {
             id,
             side,
@@ -425,6 +499,12 @@ impl Engine {
     /// Removes a resting order from its level and frees its slot. The caller updates the index.
     fn detach(&mut self, slot: u32) {
         let Node { side, price, .. } = self.nodes[slot as usize];
+        self.free.push(slot);
+        if price == MARKET {
+            let queue = market_queue(&mut self.market_bids, &mut self.market_asks, side);
+            unlink(queue, &mut self.nodes, slot);
+            return;
+        }
         let Entry::Occupied(mut entry) =
             side_book(&mut self.bids, &mut self.asks, side).entry(price)
         else {
@@ -434,7 +514,221 @@ impl Engine {
         if entry.get().count == 0 {
             entry.remove();
         }
-        self.free.push(slot);
+    }
+
+    /// Enters (or restarts) a call phase and cancels resting post-only orders in book order.
+    fn start_call(&mut self, reference: Option<Price>, out: &mut Vec<Event>) {
+        self.phase = Phase::Call;
+        self.reference = reference.filter(|&price| price > 0).or(self.last_trade);
+        out.push(Event::CallStarted {
+            reference: self.reference,
+        });
+        let mut post_only = Vec::new();
+        self.for_each_resting(|node| {
+            if node.post_only {
+                post_only.push(node.id);
+            }
+        });
+        for id in post_only {
+            let slot = self.index.remove(&id).expect("listed order rests");
+            let remaining = self.nodes[slot as usize].remaining;
+            self.detach(slot);
+            out.push(Event::Canceled {
+                id,
+                remaining,
+                reason: CancelReason::CallPhase,
+            });
+        }
+    }
+
+    /// Ends the call phase. A crossed book, or one with market orders waiting, is uncrossed
+    /// first, so continuous trading never starts from a state it could not reach itself.
+    fn resume(&mut self, out: &mut Vec<Event>) {
+        let crossed = matches!(
+            (self.bids.last_key_value(), self.asks.first_key_value()),
+            (Some((bid, _)), Some((ask, _))) if bid >= ask
+        );
+        if crossed || self.market_bids.count + self.market_asks.count > 0 {
+            self.uncross(out);
+        }
+        self.phase = Phase::Continuous;
+        self.reference = None;
+        out.push(Event::Resumed);
+    }
+
+    /// Executes the auction at one clearing price, then cancels what is left of the waiting
+    /// market orders. Each side fills in priority order: market orders first, then better
+    /// limits, then earlier orders. Each trade pairs the first unfilled buy with the first
+    /// unfilled sell.
+    fn uncross(&mut self, out: &mut Vec<Event>) {
+        let summary = self.indicative_uncross();
+        if let Some(price) = summary.price {
+            let buys = self.allocate(Side::Buy, price, summary.volume);
+            let sells = self.allocate(Side::Sell, price, summary.volume);
+            let open = |slot: u32| self.nodes[slot as usize].remaining;
+            let (mut buy, mut sell) = (0, 0);
+            let (mut buy_left, mut sell_left) = (buys[0].1, sells[0].1);
+            let (mut buy_open, mut sell_open) = (open(buys[0].0), open(sells[0].0));
+            loop {
+                let qty = buy_left.min(sell_left);
+                buy_left -= qty;
+                sell_left -= qty;
+                buy_open -= qty;
+                sell_open -= qty;
+                out.push(Event::AuctionTrade {
+                    buy: self.nodes[buys[buy].0 as usize].id,
+                    sell: self.nodes[sells[sell].0 as usize].id,
+                    price,
+                    qty,
+                    buy_remaining: buy_open,
+                    sell_remaining: sell_open,
+                });
+                if buy_left == 0 {
+                    buy += 1;
+                    let Some(&(slot, fill)) = buys.get(buy) else {
+                        break;
+                    };
+                    (buy_left, buy_open) = (fill, open(slot));
+                }
+                if sell_left == 0 {
+                    sell += 1;
+                    let Some(&(slot, fill)) = sells.get(sell) else {
+                        break;
+                    };
+                    (sell_left, sell_open) = (fill, open(slot));
+                }
+            }
+            for &(slot, fill) in buys.iter().chain(&sells) {
+                self.fill(slot, fill);
+            }
+            self.last_trade = Some(price);
+        }
+        for side in [Side::Buy, Side::Sell] {
+            let queue = std::mem::take(market_queue(
+                &mut self.market_bids,
+                &mut self.market_asks,
+                side,
+            ));
+            let mut slot = queue.head;
+            while slot != NIL {
+                let node = self.nodes[slot as usize];
+                self.index.remove(&node.id);
+                self.free.push(slot);
+                out.push(Event::Canceled {
+                    id: node.id,
+                    remaining: node.remaining,
+                    reason: CancelReason::Unfilled,
+                });
+                slot = node.next;
+            }
+        }
+        out.push(summary.event());
+    }
+
+    /// The orders on `side` that trade `volume` lots at `price`, with their fills, in
+    /// priority order: the market queue, then the levels from the best price to `price`.
+    /// Only the last one can be a partial fill.
+    fn allocate(&self, side: Side, price: Price, volume: Qty) -> Vec<(u32, Qty)> {
+        let once = std::iter::once;
+        match side {
+            Side::Buy => {
+                let levels = self.bids.range(price..).rev().map(|(_, level)| level);
+                self.collect_fills(once(&self.market_bids).chain(levels), volume)
+            }
+            Side::Sell => {
+                let levels = self.asks.range(..=price).map(|(_, level)| level);
+                self.collect_fills(once(&self.market_asks).chain(levels), volume)
+            }
+        }
+    }
+
+    /// Walks `queues` in order and takes orders until `volume` lots are covered.
+    fn collect_fills<'a>(
+        &self,
+        queues: impl Iterator<Item = &'a Level>,
+        volume: Qty,
+    ) -> Vec<(u32, Qty)> {
+        let mut fills = Vec::new();
+        let mut left = volume;
+        for level in queues {
+            let mut slot = level.head;
+            while slot != NIL {
+                let node = &self.nodes[slot as usize];
+                let fill = node.remaining.min(left);
+                fills.push((slot, fill));
+                left -= fill;
+                if left == 0 {
+                    return fills;
+                }
+                slot = node.next;
+            }
+        }
+        fills
+    }
+
+    /// Takes `fill` lots from a resting order, removing it when it is used up.
+    fn fill(&mut self, slot: u32, fill: Qty) {
+        let node = self.nodes[slot as usize];
+        if fill == node.remaining {
+            self.index.remove(&node.id);
+            self.detach(slot);
+            return;
+        }
+        self.nodes[slot as usize].remaining -= fill;
+        let level = if node.price == MARKET {
+            market_queue(&mut self.market_bids, &mut self.market_asks, node.side)
+        } else {
+            side_book(&mut self.bids, &mut self.asks, node.side)
+                .get_mut(&node.price)
+                .expect("resting order has a level")
+        };
+        level.total -= fill;
+    }
+
+    /// What an uncross would execute now: the clearing price, volume and surplus that an
+    /// exchange publishes during a call phase. In continuous trading the book never crosses,
+    /// so nothing would execute.
+    #[must_use]
+    pub fn indicative_uncross(&self) -> UncrossSummary {
+        auction::determine(
+            self.bids.iter().map(|(&price, level)| (price, level.total)),
+            self.asks.iter().map(|(&price, level)| (price, level.total)),
+            self.market_bids.total,
+            self.market_asks.total,
+            self.reference,
+        )
+    }
+
+    /// The current trading phase.
+    #[must_use]
+    pub const fn phase(&self) -> Phase {
+        self.phase
+    }
+
+    /// The reference price of the current call phase: the one given to
+    /// [`Command::StartCall`], or the last trade price when the call started. `None` in
+    /// continuous trading.
+    #[must_use]
+    pub const fn reference_price(&self) -> Option<Price> {
+        self.reference
+    }
+
+    /// The price of the most recent trade, continuous or auction.
+    #[must_use]
+    pub const fn last_trade_price(&self) -> Option<Price> {
+        self.last_trade
+    }
+
+    /// Market orders waiting for an uncross on one side, in time priority. Their price is 0.
+    #[must_use]
+    pub fn market_orders(&self, side: Side) -> Vec<OrderView> {
+        let queue = match side {
+            Side::Buy => &self.market_bids,
+            Side::Sell => &self.market_asks,
+        };
+        let mut views = Vec::new();
+        self.walk(queue, |node| views.push(order_view(node)));
+        views
     }
 
     /// True when an order on `side` at `limit` would trade immediately.
@@ -575,7 +869,8 @@ impl Engine {
     }
 
     /// Every resting order in canonical order: bids from the best price down, then asks
-    /// from the best price up, each level in time priority.
+    /// from the best price up, each level in time priority. In a call phase, each side's
+    /// waiting market orders come first, as they have the highest priority in an uncross.
     #[must_use]
     pub fn snapshot(&self) -> Vec<OrderView> {
         let mut views = Vec::with_capacity(self.len());
@@ -591,9 +886,14 @@ impl Engine {
         fingerprint.value()
     }
 
-    /// The time-priority counter: the last priority handed to a resting order.
-    pub(crate) const fn clock(&self) -> u64 {
-        self.clock
+    /// Everything besides the resting orders that a snapshot must keep.
+    pub(crate) const fn session_state(&self) -> SessionState {
+        SessionState {
+            clock: self.clock,
+            phase: self.phase,
+            reference: self.reference,
+            last_trade: self.last_trade,
+        }
     }
 
     /// Visits every resting order in [`Self::snapshot`] order with its time priority.
@@ -603,7 +903,7 @@ impl Engine {
 
     /// Rebuilds a book from resting orders listed in [`Self::snapshot`] order with their
     /// time priorities. The caller has validated them (see [`crate::snapshot::decode`]).
-    pub(crate) fn restore(clock: u64, orders: &[(OrderView, u64)]) -> Self {
+    pub(crate) fn restore(state: SessionState, orders: &[(OrderView, u64)]) -> Self {
         let mut engine = Self::with_capacity(orders.len());
         for &(view, priority) in orders {
             let slot = u32::try_from(engine.nodes.len())
@@ -622,20 +922,31 @@ impl Engine {
                 prev: NIL,
                 next: NIL,
             });
-            let level = side_book(&mut engine.bids, &mut engine.asks, view.side)
-                .entry(view.price)
-                .or_insert(Level::EMPTY);
+            let level = if view.price == MARKET {
+                market_queue(&mut engine.market_bids, &mut engine.market_asks, view.side)
+            } else {
+                side_book(&mut engine.bids, &mut engine.asks, view.side)
+                    .entry(view.price)
+                    .or_insert(Level::EMPTY)
+            };
             link_back(level, &mut engine.nodes, slot);
             engine.index.insert(view.id, slot);
         }
-        engine.clock = clock;
+        engine.clock = state.clock;
+        engine.phase = state.phase;
+        engine.reference = state.reference;
+        engine.last_trade = state.last_trade;
         engine
     }
 
+    /// Visits resting orders in priority order: waiting market buys, bids from the best
+    /// price down, waiting market sells, then asks from the best price up.
     fn for_each_resting(&self, mut visit: impl FnMut(&Node)) {
+        self.walk(&self.market_bids, &mut visit);
         for level in self.bids.values().rev() {
             self.walk(level, &mut visit);
         }
+        self.walk(&self.market_asks, &mut visit);
         for level in self.asks.values() {
             self.walk(level, &mut visit);
         }
@@ -656,47 +967,19 @@ impl Engine {
     /// Returns a description of the first violated invariant.
     pub fn check_invariants(&self) -> Result<(), String> {
         let mut seen = 0usize;
-        for (side, book) in [(Side::Buy, &self.bids), (Side::Sell, &self.asks)] {
+        for (side, market, book) in [
+            (Side::Buy, &self.market_bids, &self.bids),
+            (Side::Sell, &self.market_asks, &self.asks),
+        ] {
+            if market.count > 0 && self.phase == Phase::Continuous {
+                return Err(format!("{side} market orders rest in continuous trading"));
+            }
+            seen += self.check_queue(side, MARKET, market)?;
             for (&price, level) in book {
-                if level.count == 0 || level.head == NIL || level.tail == NIL {
+                if level.count == 0 {
                     return Err(format!("empty {side} level at {price}"));
                 }
-                let (mut count, mut total, mut prev, mut last_priority) = (0u32, 0u64, NIL, 0u64);
-                let mut slot = level.head;
-                while slot != NIL {
-                    let node = &self.nodes[slot as usize];
-                    let id = node.id;
-                    if node.prev != prev {
-                        return Err(format!("order {id}: broken back link"));
-                    }
-                    if node.side != side || node.price != price {
-                        return Err(format!("order {id}: stored in the wrong level"));
-                    }
-                    if node.remaining == 0 || node.remaining > MAX_QTY {
-                        return Err(format!("order {id}: open quantity {}", node.remaining));
-                    }
-                    if node.priority <= last_priority {
-                        return Err(format!("order {id}: queue out of time priority"));
-                    }
-                    if self.index.get(&id) != Some(&slot) {
-                        return Err(format!("order {id}: id index points elsewhere"));
-                    }
-                    last_priority = node.priority;
-                    count += 1;
-                    total += node.remaining;
-                    prev = slot;
-                    slot = node.next;
-                }
-                if level.tail != prev {
-                    return Err(format!("{side} level {price}: tail is not the last order"));
-                }
-                if count != level.count || total != level.total {
-                    return Err(format!(
-                        "{side} level {price}: cached count/total {}/{} but queue has {count}/{total}",
-                        level.count, level.total
-                    ));
-                }
-                seen += count as usize;
+                seen += self.check_queue(side, price, level)?;
             }
         }
         if seen != self.index.len() {
@@ -710,13 +993,60 @@ impl Engine {
         }
         if let (Some(bid), Some(ask)) = (self.best_bid(), self.best_ask())
             && bid.price >= ask.price
+            && self.phase == Phase::Continuous
         {
             return Err(format!(
                 "crossed book: bid {} >= ask {}",
                 bid.price, ask.price
             ));
         }
+        if self.phase == Phase::Continuous && self.reference.is_some() {
+            return Err("a reference price outside a call phase".to_owned());
+        }
         Ok(())
+    }
+
+    /// Checks one level or market queue and returns its order count.
+    fn check_queue(&self, side: Side, price: Price, level: &Level) -> Result<usize, String> {
+        let (mut count, mut total, mut prev, mut last_priority) = (0u32, 0u64, NIL, 0u64);
+        let mut slot = level.head;
+        while slot != NIL {
+            let node = &self.nodes[slot as usize];
+            let id = node.id;
+            if node.prev != prev {
+                return Err(format!("order {id}: broken back link"));
+            }
+            if node.side != side || node.price != price {
+                return Err(format!("order {id}: stored in the wrong level"));
+            }
+            if node.remaining == 0 || node.remaining > MAX_QTY {
+                return Err(format!("order {id}: open quantity {}", node.remaining));
+            }
+            if node.priority <= last_priority {
+                return Err(format!("order {id}: queue out of time priority"));
+            }
+            if node.post_only && self.phase == Phase::Call {
+                return Err(format!("order {id}: post-only order in a call phase"));
+            }
+            if self.index.get(&id) != Some(&slot) {
+                return Err(format!("order {id}: id index points elsewhere"));
+            }
+            last_priority = node.priority;
+            count += 1;
+            total += node.remaining;
+            prev = slot;
+            slot = node.next;
+        }
+        if level.tail != prev {
+            return Err(format!("{side} level {price}: tail is not the last order"));
+        }
+        if count != level.count || total != level.total {
+            return Err(format!(
+                "{side} level {price}: cached count/total {}/{} but queue has {count}/{total}",
+                level.count, level.total
+            ));
+        }
+        Ok(count as usize)
     }
 }
 
@@ -725,6 +1055,13 @@ fn side_book<'a>(
     asks: &'a mut BTreeMap<Price, Level>,
     side: Side,
 ) -> &'a mut BTreeMap<Price, Level> {
+    match side {
+        Side::Buy => bids,
+        Side::Sell => asks,
+    }
+}
+
+const fn market_queue<'a>(bids: &'a mut Level, asks: &'a mut Level, side: Side) -> &'a mut Level {
     match side {
         Side::Buy => bids,
         Side::Sell => asks,

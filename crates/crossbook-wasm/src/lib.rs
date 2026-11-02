@@ -7,10 +7,10 @@
 
 use std::fmt::Write as _;
 
-use crossbook::flow::{Flow, FlowConfig};
+use crossbook::flow::{Flow, FlowConfig, Schedule};
 use crossbook::{
-    CancelReason, Command, Engine, Event, NewOrder, OrderKind, RejectReason, Side, StpMode,
-    TimeInForce, digest,
+    CancelReason, Command, Engine, Event, NewOrder, OrderKind, OrderView, Phase, RejectReason,
+    Side, StpMode, TimeInForce, UncrossSummary, digest,
 };
 use wasm_bindgen::prelude::*;
 
@@ -119,6 +119,25 @@ impl Playground {
         })
     }
 
+    /// Starts an auction call phase and returns the events as JSON. Without a reference
+    /// price, the auction uses the last trade price.
+    #[wasm_bindgen(js_name = startCall)]
+    pub fn start_call(&mut self, reference: Option<i32>) -> String {
+        self.apply(&Command::StartCall {
+            reference: reference.map(i64::from),
+        })
+    }
+
+    /// Runs the uncross and returns the events as JSON.
+    pub fn uncross(&mut self) -> String {
+        self.apply(&Command::Uncross)
+    }
+
+    /// Returns to continuous trading and returns the events as JSON.
+    pub fn resume(&mut self) -> String {
+        self.apply(&Command::Resume)
+    }
+
     fn apply(&mut self, command: &Command) -> String {
         self.events.clear();
         self.engine.process(command, &mut self.events);
@@ -143,12 +162,25 @@ impl Playground {
         self.levels_json(Side::Sell, &depth.asks, &mut json);
         let _ = write!(
             json,
-            ",\"orders\":{},\"bidLevels\":{},\"askLevels\":{},\"stateHash\":\"{:016x}\"}}",
+            ",\"orders\":{},\"bidLevels\":{},\"askLevels\":{},\"stateHash\":\"{:016x}\"",
             self.engine.len(),
             self.engine.level_count(Side::Buy),
             self.engine.level_count(Side::Sell),
             self.engine.state_hash()
         );
+        let phase = match self.engine.phase() {
+            Phase::Continuous => "continuous",
+            Phase::Call => "call",
+        };
+        let _ = write!(json, ",\"phase\":\"{phase}\",\"referencePrice\":");
+        optional_json(self.engine.reference_price(), &mut json);
+        json.push_str(",\"marketBids\":");
+        queue_json(&self.engine.market_orders(Side::Buy), &mut json);
+        json.push_str(",\"marketAsks\":");
+        queue_json(&self.engine.market_orders(Side::Sell), &mut json);
+        json.push_str(",\"indicative\":");
+        summary_json(&self.engine.indicative_uncross(), &mut json);
+        json.push('}');
         json
     }
 
@@ -160,20 +192,11 @@ impl Playground {
             }
             let _ = write!(
                 json,
-                "{{\"price\":{},\"qty\":{},\"queue\":[",
+                "{{\"price\":{},\"qty\":{},\"queue\":",
                 level.price, level.qty
             );
-            for (position, order) in self.engine.queue(side, level.price).iter().enumerate() {
-                if position > 0 {
-                    json.push(',');
-                }
-                let _ = write!(
-                    json,
-                    "{{\"id\":{},\"account\":{},\"qty\":{},\"postOnly\":{}}}",
-                    order.id, order.account, order.remaining, order.post_only
-                );
-            }
-            json.push_str("]}");
+            queue_json(&self.engine.queue(side, level.price), json);
+            json.push('}');
         }
         json.push(']');
     }
@@ -183,6 +206,17 @@ impl Playground {
         self.staged = Flow::new(FlowConfig::seeded(u64::from(seed)))
             .take(count as usize)
             .collect();
+    }
+
+    /// Like [`Self::stage`], but the commands form trading days with opening and closing
+    /// auctions (the CLI's `--auctions`).
+    #[wasm_bindgen(js_name = stageSession)]
+    pub fn stage_session(&mut self, count: u32, seed: u32) {
+        let config = FlowConfig {
+            session: Some(Schedule::default()),
+            ..FlowConfig::seeded(u64::from(seed))
+        };
+        self.staged = Flow::new(config).take(count as usize).collect();
     }
 
     /// Runs the staged commands through a fresh engine and returns a JSON summary.
@@ -199,7 +233,7 @@ impl Playground {
             engine.process(command, &mut events);
             for event in &events {
                 fingerprint.event(event);
-                if let Event::Trade { qty, .. } = event {
+                if let Event::Trade { qty, .. } | Event::AuctionTrade { qty, .. } = event {
                     trades += 1;
                     volume += qty;
                 }
@@ -233,6 +267,7 @@ fn reject_name(reason: RejectReason) -> &'static str {
         RejectReason::UnknownOrder => "unknown-order",
         RejectReason::PostOnlyWouldCross => "post-only-would-cross",
         RejectReason::FillOrKillUnfillable => "fill-or-kill-unfillable",
+        RejectReason::NeedsContinuousTrading => "needs-continuous-trading",
     }
 }
 
@@ -241,7 +276,46 @@ fn cancel_name(reason: CancelReason) -> &'static str {
         CancelReason::Requested => "requested",
         CancelReason::Unfilled => "unfilled",
         CancelReason::SelfTrade => "self-trade",
+        CancelReason::CallPhase => "call-phase",
     }
+}
+
+fn optional_json(value: Option<i64>, json: &mut String) {
+    match value {
+        Some(value) => {
+            let _ = write!(json, "{value}");
+        }
+        None => json.push_str("null"),
+    }
+}
+
+fn queue_json(orders: &[OrderView], json: &mut String) {
+    json.push('[');
+    for (position, order) in orders.iter().enumerate() {
+        if position > 0 {
+            json.push(',');
+        }
+        let _ = write!(
+            json,
+            "{{\"id\":{},\"account\":{},\"qty\":{},\"postOnly\":{}}}",
+            order.id, order.account, order.remaining, order.post_only
+        );
+    }
+    json.push(']');
+}
+
+fn summary_json(summary: &UncrossSummary, json: &mut String) {
+    json.push_str("{\"price\":");
+    optional_json(summary.price, json);
+    let side = summary.imbalance_side.map_or("null", |side| match side {
+        Side::Buy => "\"buy\"",
+        Side::Sell => "\"sell\"",
+    });
+    let _ = write!(
+        json,
+        ",\"volume\":{},\"imbalanceSide\":{side},\"imbalance\":{}}}",
+        summary.volume, summary.imbalance
+    );
 }
 
 fn event_json(event: &Event, json: &mut String) {
@@ -311,6 +385,51 @@ fn event_json(event: &Event, json: &mut String) {
             json,
             "{{\"type\":\"modified\",\"id\":{id},\"price\":{price},\"qty\":{qty},\"keptPriority\":{kept_priority}}}"
         ),
+        Event::MarketBooked { id, side, qty } => write!(
+            json,
+            "{{\"type\":\"market-booked\",\"id\":{id},\"side\":\"{}\",\"qty\":{qty}}}",
+            side_name(side)
+        ),
+        Event::CallStarted { reference } => {
+            json.push_str("{\"type\":\"call-started\",\"reference\":");
+            optional_json(reference, json);
+            json.push('}');
+            Ok(())
+        }
+        Event::AuctionTrade {
+            buy,
+            sell,
+            price,
+            qty,
+            buy_remaining,
+            sell_remaining,
+        } => write!(
+            json,
+            "{{\"type\":\"auction-trade\",\"buy\":{buy},\"sell\":{sell},\"price\":{price},\"qty\":{qty},\"buyRemaining\":{buy_remaining},\"sellRemaining\":{sell_remaining}}}"
+        ),
+        Event::Uncrossed {
+            price,
+            volume,
+            imbalance_side,
+            imbalance,
+        } => {
+            json.push_str("{\"type\":\"uncrossed\",\"summary\":");
+            summary_json(
+                &UncrossSummary {
+                    price,
+                    volume,
+                    imbalance_side,
+                    imbalance,
+                },
+                json,
+            );
+            json.push('}');
+            Ok(())
+        }
+        Event::Resumed => {
+            json.push_str("{\"type\":\"resumed\"}");
+            Ok(())
+        }
     };
 }
 
@@ -328,6 +447,55 @@ mod tests {
             "[{\"type\":\"accepted\",\"id\":2,\"side\":\"buy\",\"price\":101,\"qty\":3},{\"type\":\"trade\",\"taker\":2,\"maker\":1,\"side\":\"buy\",\"price\":101,\"qty\":3,\"takerRemaining\":0,\"makerRemaining\":2}]"
         );
         assert!(playground.book(5).contains("\"asks\":[{\"price\":101,\"qty\":2,\"queue\":[{\"id\":1,\"account\":1,\"qty\":2,\"postOnly\":false}]}]"));
+    }
+
+    #[test]
+    fn an_auction_round_trips_through_json() {
+        let mut playground = Playground::new();
+        assert_eq!(
+            playground.start_call(Some(100)),
+            "[{\"type\":\"call-started\",\"reference\":100}]"
+        );
+        playground.submit("sell", "limit", 99, 4, "gtc", false, 1, "allow");
+        assert_eq!(
+            playground.submit("buy", "market", 0, 6, "gtc", false, 2, "allow"),
+            "[{\"type\":\"accepted\",\"id\":2,\"side\":\"buy\",\"price\":null,\"qty\":6},{\"type\":\"market-booked\",\"id\":2,\"side\":\"buy\",\"qty\":6}]"
+        );
+        let book = playground.book(5);
+        assert!(
+            book.contains("\"phase\":\"call\",\"referencePrice\":100"),
+            "{book}"
+        );
+        assert!(
+            book.contains("\"marketBids\":[{\"id\":2,\"account\":2,\"qty\":6,\"postOnly\":false}]"),
+            "{book}"
+        );
+        assert!(book.contains("\"indicative\":{\"price\":99,\"volume\":4,\"imbalanceSide\":\"buy\",\"imbalance\":2}"), "{book}");
+        assert_eq!(
+            playground.uncross(),
+            "[{\"type\":\"auction-trade\",\"buy\":2,\"sell\":1,\"price\":99,\"qty\":4,\"buyRemaining\":2,\"sellRemaining\":0},{\"type\":\"canceled\",\"id\":2,\"remaining\":2,\"reason\":\"unfilled\"},{\"type\":\"uncrossed\",\"summary\":{\"price\":99,\"volume\":4,\"imbalanceSide\":\"buy\",\"imbalance\":2}}]"
+        );
+        assert_eq!(playground.resume(), "[{\"type\":\"resumed\"}]");
+        assert!(
+            playground
+                .book(5)
+                .contains("\"phase\":\"continuous\",\"referencePrice\":null")
+        );
+    }
+
+    #[test]
+    fn staged_session_matches_native_golden_digest() {
+        let mut playground = Playground::new();
+        playground.stage_session(200_000, 42);
+        let summary = playground.run_staged();
+        assert!(
+            summary.contains("\"eventDigest\":\"a0e26dd141f0f853\""),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("\"stateHash\":\"a0fbd4956bedd22b\""),
+            "{summary}"
+        );
     }
 
     #[test]

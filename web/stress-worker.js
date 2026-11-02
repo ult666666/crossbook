@@ -7,14 +7,15 @@ import init, { Playground } from './pkg/crossbook_wasm.js';
 const ready = init();
 
 self.onmessage = async ({ data }) => {
-  const { count, seed } = data;
+  const { count, seed, auctions } = data;
   try {
     await ready;
     const playground = new Playground();
     try {
       self.postMessage({ type: 'progress', phase: 'generate' });
       const g0 = performance.now();
-      playground.stage(count, seed);
+      if (auctions) playground.stageSession(count, seed);
+      else playground.stage(count, seed);
       const generationMs = performance.now() - g0;
 
       self.postMessage({ type: 'progress', phase: 'match' });

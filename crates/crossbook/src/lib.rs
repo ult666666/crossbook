@@ -7,6 +7,9 @@
 //! - **Order types.** Limit and market orders; good-till-canceled, immediate-or-cancel and
 //!   fill-or-kill; post-only; cancel; modify with explicit priority rules; four
 //!   self-trade prevention modes.
+//! - **Call auctions.** A call phase collects orders without matching; the uncross picks
+//!   one clearing price by maximum volume, minimum surplus, market pressure and the
+//!   reference price, and executes every crossing order at it in price-time priority.
 //! - **Deterministic.** No clocks, randomness or hash-map iteration in the matching path.
 //!   The same commands always produce the same events, on any platform.
 //! - **Checked two ways.** [`reference::ReferenceEngine`] implements the same rules with
@@ -38,10 +41,31 @@
 //! );
 //! assert!(engine.is_empty());
 //! ```
+//!
+//! A call auction: orders cross without trading until the uncross, which executes them at
+//! one price.
+//!
+//! ```
+//! use crossbook::{Command, Engine, NewOrder, Side, UncrossSummary};
+//!
+//! let mut engine = Engine::new();
+//! let mut events = Vec::new();
+//! engine.process(&Command::StartCall { reference: Some(100) }, &mut events);
+//! engine.process(&Command::New(NewOrder::limit(1, Side::Buy, 101, 8)), &mut events);
+//! engine.process(&Command::New(NewOrder::limit(2, Side::Sell, 100, 5)), &mut events);
+//!
+//! // 5 lots can trade at 100 or 101, with 3 left to buy at both: buyers press, so 101.
+//! let summary = UncrossSummary { price: Some(101), volume: 5, imbalance_side: Some(Side::Buy), imbalance: 3 };
+//! assert_eq!(engine.indicative_uncross(), summary);
+//! engine.process(&Command::Uncross, &mut events);
+//! engine.process(&Command::Resume, &mut events);
+//! assert_eq!(engine.order(1).map(|order| order.remaining), Some(3));
+//! ```
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod auction;
 pub mod codec;
 pub mod digest;
 mod engine;
@@ -57,5 +81,6 @@ mod types;
 pub use engine::Engine;
 pub use types::{
     AccountId, CancelReason, Command, Depth, Event, LevelView, MAX_QTY, NewOrder, OrderId,
-    OrderKind, OrderView, Price, Qty, RejectReason, Side, StpMode, TimeInForce,
+    OrderKind, OrderView, Phase, Price, Qty, RejectReason, Side, StpMode, TimeInForce,
+    UncrossSummary,
 };

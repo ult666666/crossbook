@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 7e3b2e2fa73fc08354559f2d4fee92976e8a64b655c0edc886ea216f519dd0e6 # shrinks to orders = [AuctionOrder { side: Sell, limit: Some(98), qty: 1 }, AuctionOrder { side: Sell, limit: Some(98), qty: 2 }, AuctionOrder { side: Buy, limit: Some(99), qty: 2 }, AuctionOrder { side: Buy, limit: Some(99), qty: 2 }], reference = None
+cc 580e590ed35a28afe7d29634ef733c94778d913e7f18926745eec757b561e3a9 # shrinks to orders = [AuctionOrder { side: Buy, limit: Some(102), qty: 1 }, AuctionOrder { side: Sell, limit: Some(98), qty: 1 }, AuctionOrder { side: Sell, limit: Some(99), qty: 1 }, AuctionOrder { side: Sell, limit: Some(100), qty: 1 }, AuctionOrder { side: Buy, limit: None, qty: 1 }, AuctionOrder { side: Sell, limit: Some(101), qty: 1 }, AuctionOrder { side: Buy, limit: Some(101), qty: 1 }], reference = None
+cc df9d8b71850a8cb6115f56af63a9a3d2b13339aec73d70cf95a7db574f1948a4 # shrinks to orders = [AuctionOrder { side: Buy, limit: None, qty: 1 }], reference = None
