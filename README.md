@@ -1,79 +1,33 @@
 # crossbook
 
-A limit order book and matching engine in Rust: price-time priority, the order types
-real venues use, opening and closing call auctions, and a deterministic event stream,
-checked against a second implementation and compiled to WebAssembly so it runs in your
-browser.
+A limit order book and matching engine in Rust. It matches orders by price-time
+priority, runs opening and closing call auctions, and reports every change to the
+book as an ordered list of events. The engine crate has no dependencies, and the
+same code compiles to WebAssembly for a browser playground.
 
 [![CI](https://github.com/ult666666/crossbook/actions/workflows/ci.yml/badge.svg)](https://github.com/ult666666/crossbook/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](Cargo.toml)
 
-**[Open the playground](https://ult666666.github.io/crossbook/)**: place orders against a
-live book, step through guided scenarios, and run a million synthetic orders in your
-browser. The [case study](https://ult666666.github.io/projects/crossbook.html) walks through
-the design, the testing and the results.
+In the [playground](https://ult666666.github.io/crossbook/) you can place orders
+against a live book, step through guided scenarios and time a million synthetic
+orders in your browser. The [case study](https://ult666666.github.io/projects/crossbook.html)
+covers the design and the testing.
 
-![The crossbook playground: order ticket, order book ladder with per-level queues, and event log](docs/playground.png)
+![The crossbook playground: order ticket, order book with per-level queues, and event log](docs/playground.png)
 
-## What it does
+## Try it
 
-- **Price-time priority.** Better prices trade first; at one price, earlier orders trade
-  first. Every trade prints at the resting order's price.
-- **Order types.** Limit and market; good-till-canceled, immediate-or-cancel and
-  fill-or-kill; post-only; cancel; modify with explicit queue-priority rules; four
-  self-trade prevention modes.
-- **Call auctions.** A call phase collects orders without matching, as exchanges do
-  before the open, before the close and after a halt. The uncross picks one clearing
-  price by the rules Xetra and Euronext publish (most volume, then smallest surplus, then
-  market pressure, then the reference price) and fills every crossing order at it in
-  price-time priority. During the call, an indicative uncross reports the price, volume and
-  surplus an uncross would produce.
-- **Events, not state.** Each command emits a precise, ordered list of events: accepted,
-  trade, booked, canceled, rejected, modified, and for auctions call started, auction
-  trade and uncrossed. The full contract is in [docs/SEMANTICS.md](docs/SEMANTICS.md).
-- **Deterministic.** The same commands produce the same events on x86-64 Linux, ARM64
-  macOS, Windows and WebAssembly. CI checks all four.
-- **Crash recovery.** Checksummed snapshots plus a write-ahead journal rebuild the book
-  exactly after a crash, also in the middle of a call phase, and a half-written final
-  command is detected and ignored. Files from earlier versions still load.
-- **Market data.** Trade prints and price-level updates are derived from the event
-  stream alone, with sequence numbers, gap detection and resynchronization for
-  subscribers.
-- **Many instruments.** A sequencer, worker shards and an ordered merge spread
-  instruments across threads, with output identical to one thread for any shard count.
-- **Small.** The engine crate has no dependencies and no `unsafe` code.
-
-## Results
-
-| | |
-| --- | --- |
-| Throughput, one core, synthetic flow | 15 to 16 million commands per second |
-| Latency per command, p50 / p99 / p99.9 | 64 ns / 196 ns / 477 ns |
-| Same session compiled to WebAssembly (Node.js) | about 8.3 million commands per second, with the same event digest and state hash as the native build |
-| Differential tests against the reference model | 1,024 random command streams per local run, 4,096 in CI, plus one-million-command checks with and without auctions |
-| Auction price against brute force | Agrees on 20,000 seeded books where every rule decides at least 126 times, plus 1,024 random books per run; every uncross passes seven allocation invariants |
-| Uncross on a closing call book of 8,452 orders | About 54 µs for 1,608 fills; the indicative uncross takes about 0.34 µs |
-| Mutation testing (cargo-mutants) | Engine: 140 of 148 compiling mutants caught; of the 8 survivors, 4 are now covered by new assertions, 2 pointed at redundant code that was deleted, and 2 only drop a capacity hint. Recovery, market data and sharding: 165 of 175 caught after closing 14 gaps; the 10 survivors only change buffer recycling or comparisons where equality is already ruled out. Auction code: 310 of 323 caught (3 by timeout); 5 survivors led to fixes, and the 8 left cannot change behavior |
-| Crash recovery, one million commands | A snapshot at 400,000 commands plus the journal tail reaches the full replay's state hash; loading it and replaying 600,000 commands takes about 0.15 s |
-| Market data, one million commands | The book rebuilt from the feed alone equals the engine's; 1.16 messages per command |
-| 64 instruments on a 4-core VM | 2.6 to 3.4 times the single-thread rate with 3 or 4 shards, with identical output for every shard count |
-
-Single-book figures: a 2.1 GHz Intel Xeon cloud VM, one pinned core, Rust 1.97 (medians of three seeds, 5 million commands each). Multi-instrument figures: a 2.8 GHz 4-vCPU cloud VM. Auction figures: Criterion estimates on the same kind of 2.1 GHz VM with Rust 1.99, while other jobs shared the machine. The commands are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
-The matching core only: no network, parsing or persistence on the timed path.
-
-## Quick start
-
-Needs Rust 1.88 or newer.
+With Rust 1.88 or newer:
 
 ```bash
 git clone https://github.com/ult666666/crossbook
 cd crossbook
-cargo run --release -p crossbook-cli -- demo
-cargo run --release -p crossbook-cli -- auction
+cargo run --release -p crossbook-cli -- demo      # continuous trading
+cargo run --release -p crossbook-cli -- auction   # an opening call and its uncross
 ```
 
-The demo walks through a short session:
+Each step prints a one-line description and the events it produced:
 
 ```text
 # A buy for 8 @ 101 takes the better price first, then the older order at 101
@@ -85,38 +39,37 @@ The demo walks through a short session:
   rejected #5: fill-or-kill order cannot fill in full
 ```
 
-The auction demo prints the indicative uncross after each order of an opening call, then
-the uncross itself:
+## What it does
 
-```text
-# 8 lots can trade at 100 or 101, both with 2 lots left to sell: with sellers in excess, the lower price
-  accepted #4 buy 3 @ 101
-  booked #4 buy 3 @ 101
-  indicative uncross: 8 lots @ 100, surplus 2 sell
+Orders trade best price first and, at one price, oldest first. Every trade prints at
+the resting order's price. The engine takes limit and market orders, with
+good-till-canceled, immediate-or-cancel or fill-or-kill, plus post-only orders,
+cancels and four self-trade prevention modes. A modified order keeps its place in the
+queue only if its price stays and its quantity does not grow; otherwise it re-enters as
+a new order.
 
-# The uncross: every crossing order trades at 101, market orders first, then better prices, then earlier orders
-  auction trade 2 @ 101 (buy #5, sell #1)
-  auction trade 4 @ 101 (buy #3, sell #1)
-  auction trade 1 @ 101 (buy #3, sell #2)
-  auction trade 3 @ 101 (buy #4, sell #2)
-  auction trade 3 @ 101 (buy #8, sell #6)
-  uncrossed at 101: 13 lots, surplus 1 buy
-```
+A call phase collects orders without matching, as exchanges do before the open,
+before the close and after a halt. The uncross then picks one clearing price by the
+rules Xetra and Euronext publish: most volume, then the smallest surplus, then market
+pressure, then the price nearest a reference. Every crossing order fills at that price
+in price-time priority. During the call, `indicative_uncross()` reports the price,
+volume and surplus an uncross would give at that moment.
 
-Other commands:
+Each command produces events (accepted, trade, booked, canceled, rejected, modified,
+and for auctions call started, auction trade and uncrossed) in a defined order;
+[docs/SEMANTICS.md](docs/SEMANTICS.md) is the contract. The engine reads no clock, draws
+no random numbers and never iterates a hash map, so the same commands give the same
+events on x86-64 Linux, ARM64 macOS, Windows and WebAssembly. CI checks all four.
 
-```bash
-cargo run --release -p crossbook-cli -- bench --orders 5000000    # throughput and latency
-cargo run --release -p crossbook-cli -- verify --orders 1000000   # fast engine vs reference model
-cargo run --release -p crossbook-cli -- gen --out flow.xbk        # write a binary command journal
-cargo run --release -p crossbook-cli -- gen --auctions --out day.xbk  # trading days with opening and closing auctions
-cargo run --release -p crossbook-cli -- replay flow.xbk           # replay it and print fingerprints
-cargo run --release -p crossbook-cli -- snapshot flow.xbk --at 400000 --out flow.xbs
-cargo run --release -p crossbook-cli -- recover flow.xbk --snapshot flow.xbs   # rebuild after a crash
-cargo run --release -p crossbook-cli -- feed                      # market data, checked against the book
-cargo run --release -p crossbook-cli -- exchange                  # 64 instruments on 1 to 4 shard threads
-cargo test --workspace                                            # all tests
-```
+The rest of the system is built on that event stream:
+
+- Crash recovery replays a write-ahead journal on top of the newest checksummed
+  snapshot, also in the middle of a call phase. A half-written last command is
+  detected and skipped, and files from earlier versions still load.
+- A market-data publisher derives trade prints and price-level updates from the events
+  alone, with sequence numbers, gap detection and resynchronization.
+- A sequencer, worker shards and an ordered merge spread many instruments across
+  threads, and the output is the same for any number of shards.
 
 ## Use it as a library
 
@@ -159,44 +112,61 @@ engine.process(&Command::Resume, &mut events);
 assert_eq!(engine.order(1).map(|order| order.remaining), Some(3));
 ```
 
-## How it is checked
+## Command line
 
-- **Scenario tests** pin every rule in the spec to exact events.
-- **Differential testing.** A second, deliberately naive engine implements the same rules
-  with linear scans. Property tests feed random command streams to both and require
-  identical events and books after every command, plus structural invariants and
-  quantity conservation.
-- **Golden digests.** A 64-bit fingerprint of a 100,000-command session is pinned in the
-  tests and must match on every CI platform and in WebAssembly.
-- **Mutation testing** confirms the tests fail when the engine is broken on purpose.
-- **Crash simulation.** For random sessions, the journal is cut at a random byte and
-  recovery from the newest snapshot must reach exactly the uninterrupted run's book and
-  replay the same events; damaged snapshots must be rejected.
-- **Market data.** After every command, a subscriber's book rebuilt from the feed must
-  equal the engine's, and a lost message must be detected and repaired.
-- **Shard independence.** Random multi-instrument streams must produce exactly the
-  single-thread output for any shard count, batch size and queue length.
-- **Auctions.** A brute-force uncross that tries every candidate price must agree with the
-  engine on books built to tie at every rule, and every uncross must fill no order beyond
-  its limit, conserve volume, respect priority and leave the book uncrossed. The
-  differential, crash-recovery, market-data and shard tests all run sessions with
-  auctions.
-
-Details: [docs/TESTING.md](docs/TESTING.md).
+```bash
+cargo run --release -p crossbook-cli -- bench --orders 5000000    # throughput and latency
+cargo run --release -p crossbook-cli -- verify --orders 1000000   # fast engine vs reference model
+cargo run --release -p crossbook-cli -- gen --out flow.xbk        # write a binary command journal
+cargo run --release -p crossbook-cli -- gen --auctions --out day.xbk  # trading days with opening and closing auctions
+cargo run --release -p crossbook-cli -- replay flow.xbk           # replay it and print fingerprints
+cargo run --release -p crossbook-cli -- snapshot flow.xbk --at 400000 --out flow.xbs
+cargo run --release -p crossbook-cli -- recover flow.xbk --snapshot flow.xbs   # rebuild after a crash
+cargo run --release -p crossbook-cli -- feed                      # market data, checked against the book
+cargo run --release -p crossbook-cli -- exchange                  # 64 instruments on 1 to 4 shard threads
+cargo test --workspace                                            # all tests
+```
 
 ## How it works
 
-Price levels sit in one `BTreeMap` per side, so the best price is the first or last key.
-Each level is a FIFO queue threaded through a single slab of 48-byte order nodes with
-`u32` links, which makes cancel O(1) after the id lookup and reuses memory as orders come
-and go. The engine never reads a clock or a random number generator and never iterates a
-hash map, which is what makes it deterministic. That determinism carries the rest:
-recovery replays a journal from a snapshot, the market-data feed is a function of the
-events, and the sharded runner restores one global order with sequence numbers. A call
-phase keeps the same structures (levels may cross, and market orders wait in one queue per
-side); the uncross finds the clearing price in one pass over the cached level totals.
-Design notes, costs, the auction rules with their sources, and the alternatives
-considered: [docs/DESIGN.md](docs/DESIGN.md).
+Price levels sit in one `BTreeMap` per side, so the best price is the first or last
+key. Each level is a FIFO queue threaded through one slab of 48-byte order nodes with
+`u32` links, which makes a cancel O(1) after the id lookup and reuses memory as orders
+come and go. A call phase keeps the same structures: levels may cross, and market
+orders wait in one queue per side. The uncross finds the clearing price in one pass
+over the cached level totals. [docs/DESIGN.md](docs/DESIGN.md) covers the costs, the
+auction rules with their sources, recovery, market data, sharding and the alternatives
+considered.
+
+## How it is tested
+
+A second engine, `ReferenceEngine`, implements the same rules with linear scans and no
+clever data structures. Property tests feed random command streams to both and require
+the same events and the same book after every command, plus the fast engine's
+structural invariants. For auctions, a brute-force uncross that tries every price
+agrees with the engine on 20,000 random books, including ties at each rule.
+
+Other tests cut the journal at a random byte and require recovery to reach the
+uninterrupted run's state, rebuild the book from the market-data feed after every
+command, and run multi-instrument streams on random shard counts. Digests of long
+sessions are pinned and must match on all three CI operating systems and in
+WebAssembly. Mutation testing with cargo-mutants checks that the suite fails when the
+code is broken on purpose. [docs/TESTING.md](docs/TESTING.md) has each layer, the case
+counts and the surviving mutants.
+
+## Performance
+
+| Measure | Result |
+| --- | --- |
+| Throughput on one core | 15 to 16 million commands per second |
+| Latency per command, p50 / p99 | 64 ns / 196 ns |
+| The same engine in WebAssembly, under Node.js | about 8.3 million commands per second |
+| Uncross of a closing call with 8,452 orders | about 54 µs for 1,608 fills |
+| 64 instruments on a 4-core VM | 2.6 to 3.4 times one thread, with 3 or 4 shards |
+
+These time the matching core on synthetic order flow on cloud VMs, with no network,
+parsing or persistence on the timed path. [docs/BENCHMARKS.md](docs/BENCHMARKS.md)
+has the machines, the commands and the full tables.
 
 ## Project layout
 
@@ -208,13 +178,21 @@ considered: [docs/DESIGN.md](docs/DESIGN.md).
 | `web/` | The browser playground (static HTML, CSS and JavaScript) |
 | `docs/` | Semantics, design, testing and benchmark notes; release notes are in [CHANGELOG.md](CHANGELOG.md) |
 
-## Scope
+## Limits
 
-crossbook is a learning and benchmarking project, not an exchange. Each book holds one
-instrument in memory, and the sharded runner hosts many books in one process. There is
-no network gateway, the CLI writes journals without `fsync`, and everything runs on
-synthetic data. It is not connected to any market. Developed with AI assistance; the tests, CI checks and
-benchmark commands above are the evidence for each claim in this README.
+- Each book holds one instrument in memory, and there is no network gateway,
+  authentication or pre-trade risk check.
+- The CLI writes journals without `fsync`, so recovery shows the protocol rather than
+  a tuned storage layer.
+- The clearing price is always an order's limit (or the reference price for a book of
+  market orders), where Xetra would use the reference price itself when it falls
+  between two candidates.
+- There are no volatility interruptions or price bands, and the feed does not publish
+  the indicative price during a call.
+- All order flow is synthetic, and nothing here connects to a market.
+
+Built with AI coding assistants. The tests and CI checks described above verify its
+behavior.
 
 ## License
 

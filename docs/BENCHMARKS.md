@@ -26,13 +26,13 @@ starts. The flow is synthetic and is not calibrated to any real market.
 cargo run --release -p crossbook-cli -- bench --orders 5000000 --seed 42
 ```
 
-- **Throughput:** one untimed warm-up pass, then the best of three timed passes over the
-  same commands, each on a fresh engine.
-- **Latency:** a fourth pass times every command with `std::time::Instant` and records it
-  in an HDR histogram. The median cost of reading the clock twice is measured first and
-  subtracted, so very short commands are reported close to their true cost. Tail values
-  (p99.99 and max) include operating-system interrupts and page faults; they show what a
-  plain process on a shared machine sees, not a tuned, isolated core.
+Throughput is the best of three timed passes over the same commands, each on a fresh
+engine, after one untimed warm-up pass. For latency, a fourth pass times every command with
+`std::time::Instant` and records it in an HDR histogram. The median cost of reading the
+clock twice is measured first and subtracted, so very short commands are reported close to
+their true cost. Tail values (p99.99 and max) include operating-system interrupts and page
+faults; they show what a plain process on a shared machine sees, not a tuned, isolated
+core.
 
 Five million commands per run:
 
@@ -95,10 +95,16 @@ book outside the timed region for every iteration, so it includes cold-cache eff
 These ran on a 2.1 GHz Intel Xeon cloud VM (4 vCPUs, Linux 6.18, Rust 1.99.1) pinned to one
 core, while other jobs kept the machine's load average near 4, so treat them as upper
 bounds. On the same machine and under the same load, `crossbook bench --orders 5000000`
-for seeds 42, 1 and 2, run twice and alternating between the 0.2 and 0.3 binaries, gave
-12.2 to 16.0 million commands per second for 0.2 and 12.4 to 17.5 million for 0.3, with
-identical state hashes: adding the phase check to the continuous path made no difference
-that this noise could show. The single-book table above comes from an idle machine.
+ran twice for seeds 42, 1 and 2, alternating between the 0.2 and 0.3 binaries, with
+identical state hashes:
+
+| Binary | Commands per second |
+| --- | --- |
+| 0.2 | 12.2 to 16.0 million |
+| 0.3 | 12.4 to 17.5 million |
+
+Adding the phase check to the continuous path made no difference that this noise could
+show. The single-book table above comes from an idle machine.
 
 ## WebAssembly
 

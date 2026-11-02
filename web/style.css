@@ -891,10 +891,8 @@ input[type='number']::-webkit-outer-spin-button {
   padding: 0 var(--s4) 6px;
   border-bottom: 1px solid var(--line);
   color: var(--ink-3);
-  font-size: 10.5px;
-  font-weight: 650;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
+  font-size: 12px;
+  font-weight: 600;
   white-space: nowrap;
 }
 
@@ -967,12 +965,10 @@ input[type='number']::-webkit-outer-spin-button {
 .side-tag {
   padding: 3px 0 2px;
   border-radius: 3px;
-  font-size: 10.5px;
-  font-weight: 700;
-  letter-spacing: 0.06em;
+  font-size: 12px;
+  font-weight: 650;
   line-height: 1.2;
   text-align: center;
-  text-transform: uppercase;
 }
 
 .is-ask .side-tag {
@@ -1149,10 +1145,8 @@ input[type='number']::-webkit-outer-spin-button {
 
 .spread-label {
   color: var(--band-muted);
-  font-size: 10.5px;
-  font-weight: 650;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
+  font-size: 12px;
+  font-weight: 600;
 }
 
 .spread .num {
@@ -1325,11 +1319,9 @@ input[type='number']::-webkit-outer-spin-button {
 
 .sc-title {
   margin: 0 0 6px;
-  color: var(--ink-3);
-  font-size: 12px;
-  font-weight: 650;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
+  color: var(--ink-2);
+  font-size: 13px;
+  font-weight: 600;
 }
 
 .sc-rule {
@@ -1523,12 +1515,9 @@ input[type='number']::-webkit-outer-spin-button {
   border: 1px solid var(--line-strong);
   border-radius: 3px;
   color: var(--ink-2);
-  font-family: var(--font-mono);
-  font-size: 10.5px;
-  font-weight: 650;
-  letter-spacing: 0.03em;
+  font-size: 11.5px;
+  font-weight: 600;
   line-height: 1.2;
-  text-transform: uppercase;
   white-space: nowrap;
 }
 
@@ -1664,10 +1653,8 @@ input[type='number']::-webkit-outer-spin-button {
 .ref-table thead th {
   color: var(--ink-3);
   font-family: var(--font-ui);
-  font-size: 11px;
-  font-weight: 650;
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
+  font-size: 12px;
+  font-weight: 600;
 }
 
 .ref-table tbody th {
@@ -2057,6 +2044,10 @@ input[type='number']::-webkit-outer-spin-button {
 
   .digest-row {
     grid-template-columns: 6.5rem auto minmax(0, 1fr);
+  }
+
+  .ref-table tbody th {
+    white-space: normal;
   }
 
   .site-footer-inner {
