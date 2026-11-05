@@ -246,7 +246,7 @@ dependencies = [
 
 [[package]]
 name = "crossbook"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "criterion",
  "proptest",
@@ -254,7 +254,7 @@ dependencies = [
 
 [[package]]
 name = "crossbook-cli"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "crossbook",
  "hdrhistogram",
@@ -262,7 +262,7 @@ dependencies = [
 
 [[package]]
 name = "crossbook-wasm"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "crossbook",
  "wasm-bindgen",
