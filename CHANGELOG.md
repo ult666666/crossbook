@@ -3,7 +3,7 @@
 All notable changes to crossbook. The project follows [Semantic Versioning](https://semver.org/);
 before 1.0, a minor version may change the public API.
 
-## Unreleased
+## 0.3.1 (2026-11-05)
 
 ### Changed
 
