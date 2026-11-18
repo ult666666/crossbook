@@ -118,7 +118,10 @@ uncross of a crossed book.
 
 Short random streams keep books shallow. `tests/flow.rs` runs 40,000 commands from the
 synthetic flow generator for three seeds through both engines, comparing events after
-every command and books every 500 commands. The CLI does the same at scale:
+every command and books every 500 commands. On longer streams, `crossbook verify`
+also compares the events after every command. It checks the book, structural invariants
+and indicative uncross after the first command, every 1,024 commands thereafter,
+after each `Uncross` or `Resume`, and after the last command.
 
 ```bash
 cargo run --release -p crossbook-cli -- verify --orders 1000000 --seed 7
