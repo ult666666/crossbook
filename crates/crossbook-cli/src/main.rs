@@ -30,8 +30,8 @@ USAGE:
 COMMANDS:
     gen      Write N synthetic commands to a journal file
     replay   Run a journal through the engine and print the result and its fingerprints
-    verify   Run synthetic flow through the fast engine and the reference model and
-             require identical events and books after every command
+    verify   Compare fast engine and reference model events after every command. Compare
+             books every 1,024 commands, after each uncross or resume, and at the end
     bench    Measure throughput and per-command latency on synthetic flow
     snapshot Replay the first N commands of a journal and save the book to a snapshot
     recover  Rebuild the book from a snapshot and the journal after it, as after a crash;
